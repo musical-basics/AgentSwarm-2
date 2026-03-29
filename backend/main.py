@@ -13,6 +13,67 @@ import fcntl
 import termios
 import signal
 import datetime
+import traceback
+
+# --- GLOBAL STATE (HOISTED FOR ASGI WORKER STABILITY) ---
+active_ws_connections: list = []
+ws_locks: dict = {}
+active_pty_fds = set()
+cached_models = []
+active_swarm_tasks: dict = {}
+active_executors: dict = {}
+fs_manager = None
+# --- END GLOBAL STATE ---
+
+def get_trace_logger():
+    # Ensure _swarm_artifacts exists
+    os.makedirs("_swarm_artifacts", exist_ok=True)
+    return os.path.join("_swarm_artifacts", "backend_trace.log")
+
+def trace_event(msg: str, level: str = "INFO"):
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    log_line = f"[{timestamp}] [{level}] {msg}\n"
+    
+    # Write to file
+    try:
+        with open(get_trace_logger(), "a") as f:
+            f.write(log_line)
+    except: pass
+    
+    if level == "ERROR":
+        logging.error(msg)
+    else:
+        logging.info(msg)
+        
+    # Broadcast to all active WebSocket clients (Rule 6: Verbose logging)
+    try:
+        # Check if we are in an async loop
+        try:
+            loop = asyncio.get_running_loop()
+            stack = ""
+            if level == "ERROR":
+                stack = traceback.format_exc()
+            
+            loop.create_task(broadcast_to_all({
+                "event": "log_event",
+                "level": level,
+                "message": msg,
+                "timestamp": timestamp,
+                "stack": stack
+            }))
+        except RuntimeError:
+            pass # Not in an async loop
+    except: pass
+
+async def broadcast_to_all(data: dict):
+    global active_ws_connections
+    for ws in list(active_ws_connections):
+        try:
+            await ws.send_json(data)
+        except:
+            if ws in active_ws_connections:
+                active_ws_connections.remove(ws)
+
 import sys
 
 # Ensure the parent directory is in sys.path so that 'from backend.xxx' imports work
@@ -57,7 +118,7 @@ class LLMEngine:
             api_key=api_key or "DUMMY_KEY",
         )
 
-    async def generate(self, system_prompt: str, user_prompt: str, model_name: str = "google/gemini-2.5-flash", is_json: bool = False, max_tokens: int = 8192) -> tuple[str, any]:
+    async def generate(self, system_prompt: str, user_prompt: str, model_name: str = "google/gemini-2.0-flash-exp", is_json: bool = False, max_tokens: int = 8192) -> tuple[str, any]:
         kwargs = {
             "extra_headers": {
                 "HTTP-Referer": "http://localhost:3008",
@@ -72,6 +133,13 @@ class LLMEngine:
         }
         if is_json:
             kwargs["response_format"] = {"type": "json_object"}
+            # Azure/OpenRouter requirement: messages MUST contain literal 'json' word (Architectural Compliance 3.0)
+            json_instruction = "\n\nIMPORTANT: Response MUST be a valid JSON object. (Keyword: json)"
+            for msg in kwargs["messages"]:
+                content = msg["content"]
+                if "json" not in content.lower():
+                    msg["content"] = content + json_instruction
+            trace_event(f"JSON Keyword Compliance 3.0 injected into prompts for model: {model_name}")
             
         logging.info(f"[LLM Generate] Starting request to model: {model_name}, is_json: {is_json}")
         try:
@@ -82,7 +150,7 @@ class LLMEngine:
             logging.error(f"[LLM Generate] Failed for model {model_name}: {e}")
             raise
 
-    async def generate_stream(self, system_prompt: str, user_prompt: str, model_name: str = "google/gemini-2.5-flash", is_json: bool = False):
+    async def generate_stream(self, system_prompt: str, user_prompt: str, model_name: str = "google/gemini-2.0-flash-exp", is_json: bool = False):
         kwargs = {
             "extra_headers": {
                 "HTTP-Referer": "http://localhost:6500",
@@ -98,6 +166,11 @@ class LLMEngine:
         }
         if is_json:
             kwargs["response_format"] = {"type": "json_object"}
+            # Azure/OpenRouter requirement: messages MUST contain 'json' keyword
+            json_instruction = "\n\nIMPORTANT: Response MUST be a valid JSON object."
+            for msg in kwargs["messages"]:
+                if "json" not in msg["content"].lower():
+                    msg["content"] += json_instruction
             
         stream = await self.client.chat.completions.create(**kwargs)
         async for chunk in stream:
@@ -111,13 +184,6 @@ def load_ide_state() -> dict:
 
 def save_ide_state(state: dict):
     save_global_settings(state)
-
-active_ws_connections: List[WebSocket] = []
-active_swarm_tasks: Dict[WebSocket, asyncio.Task] = {}
-active_executors: Dict[WebSocket, Any] = {} # Logic for Trinity Upgrade
-fs_manager = None
-ls = []
-active_swarm_tasks = {}
 
 async def fetch_openrouter_models():
     global cached_models
@@ -466,9 +532,9 @@ def normalize_models_dict(models_dict, complexity):
             if complexity == 1:
                 res[k] = v.get("easy", v.get("hard", "google/gemini-2.5-flash"))
             elif complexity == 2:
-                res[k] = v.get("medium", v.get("hard", "google/gemini-2.5-flash"))
+                res[k] = v.get("medium", v.get("hard", "google/gemini-2.0-flash-exp"))
             else:
-                res[k] = v.get("hard", "google/gemini-2.5-flash")
+                res[k] = v.get("hard", "google/gemini-2.0-flash-exp")
         else:
             res[k] = v
     return res
@@ -1212,7 +1278,7 @@ Schema:
 async def websocket_endpoint(websocket: WebSocket):
     try:
         await websocket.accept()
-        active_ws_connections.add(websocket)
+        active_ws_connections.append(websocket)
         
         # Reload saved global workspace state
         state = load_ide_state()
@@ -1333,7 +1399,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 # Classification-only: show which profile/nodes will be used, don't execute
                 msg = data.get("message", "")
                 models_dict = data.get("models", {})
-                origin_model = normalize_models_dict(models_dict, 3).get("origin", "google/gemini-2.5-flash")
+                origin_model = normalize_models_dict(models_dict, 3).get("origin", "google/gemini-2.0-flash-exp")
                 try:
                     await safe_send(websocket, {"event": "station_update", "station": "origin", "status": "active"})
                     profile, complexity = await classify_intent(msg, origin_model)
@@ -1346,7 +1412,32 @@ async def websocket_endpoint(websocket: WebSocket):
                         "message": f"🔍 **Preview:** Dispatcher selected **{profile.upper()}** pipeline | Complexity {complexity}/3 | Token budget: {max_tokens:,}\n\nClick **Run Swarm** to execute."
                     })
                     await safe_send(websocket, {"event": "preview_ready", "profile": profile, "complexity": complexity})
+                    
+                    # PERSIST PREVIEW DATA (Rule 6: Verbose logging)
+                    try:
+                        log_dir = os.path.join(fs_manager.workspace_path, "_swarm_artifacts", "previews")
+                        os.makedirs(log_dir, exist_ok=True)
+                        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                        log_path = os.path.join(log_dir, f"preview_{ts}.json")
+                        
+                        audit_payload = {
+                            "timestamp": datetime.datetime.now().isoformat(),
+                            "request": msg,
+                            "profile": profile,
+                            "complexity": complexity,
+                            "models": models_dict,
+                            "budget": max_tokens,
+                            "selected_origin": origin_model
+                        }
+                        
+                        with open(log_path, "w") as f:
+                            json.dump(audit_payload, f, indent=2)
+                        
+                        trace_event(f"Architect Preview Logged: {log_path} | Payload: {json.dumps(audit_payload)}")
+                    except Exception as le:
+                        trace_event(f"Failed to log preview: {le}", "ERROR")
                 except Exception as e:
+                    trace_event(f"Preview failed: {e}", "ERROR")
                     await safe_send(websocket, {"event": "load_profile", "profile": "enterprise", "complexity": 3,
                         "message": f"⚠️ Preview failed ({e}), defaulting to Enterprise."})
                     await safe_send(websocket, {"event": "preview_ready", "profile": "enterprise", "complexity": 3})
@@ -1382,7 +1473,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
             elif command == "chat_message":
                 msg = data.get("message", "")
-                model = data.get("model", "google/gemini-2.5-flash")
+                model = data.get("model", "google/gemini-2.0-flash-exp")
                 history = data.get("history", [])
                 models_dict = data.get("models", {})
                 asyncio.create_task(execute_agent_chat(websocket, msg, model, history, fs_manager, models_dict))
@@ -1432,6 +1523,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
 @app.websocket("/pty")
 async def pty_endpoint(websocket: WebSocket):
+    global active_pty_fds
     await websocket.accept()
     
     import pty
@@ -1441,7 +1533,11 @@ async def pty_endpoint(websocket: WebSocket):
     import asyncio
     
     pid, fd = pty.fork()
-    active_pty_fds.add(fd)
+    try:
+        active_pty_fds.add(fd)
+    except NameError:
+        # Emergency initialization if for some reason the global wasn't visible
+        active_pty_fds = {fd}
     
     if pid == 0:
         os.chdir(fs_manager.workspace_path)

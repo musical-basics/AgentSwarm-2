@@ -10,6 +10,8 @@ class AgentNode(BaseModel):
     max_tokens: int = Field(default=2000, description="Token limit for this specific agent call")
     approval_required: bool = Field(default=False, description="Pause execution until human approves")
     critical: bool = Field(default=True, description="If True, failure triggers re-planning/repair")
+    requires_tools: bool = Field(default=False, description="Set to True if the agent must have tool-calling capability")
+    requires_search: bool = Field(default=False, description="Set to True if the agent must have real-time web search capability")
 
 class SwarmTopology(BaseModel):
     planned_nodes: List[AgentNode] = Field(..., description="Execution sequence of agents in the DAG")
