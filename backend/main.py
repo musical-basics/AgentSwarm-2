@@ -105,10 +105,11 @@ def load_ide_state() -> dict:
 def save_ide_state(state: dict):
     save_global_settings(state)
 
-active_ws_connections = set()
-active_pty_fds = set()
-ws_locks = {}
-cached_models = []
+active_ws_connections: List[WebSocket] = []
+active_swarm_tasks: Dict[WebSocket, asyncio.Task] = {}
+active_executors: Dict[WebSocket, Any] = {} # Logic for Trinity Upgrade
+fs_manager = None
+ls = []
 active_swarm_tasks = {}
 
 async def fetch_openrouter_models():
@@ -511,55 +512,72 @@ async def classify_intent(prompt: str, model_id: str) -> tuple[str, int]:
 
 async def execute_live_swarm(websocket: WebSocket, message: str, models_dict: dict = None, budget: float = 0.5, architect_model: str = "openai/gpt-4o"):
     try:
-        # 1. Reset & Metadata
         await safe_send(websocket, {"event": "workflow_start", "message": message})
         
         run_timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
         artifact_dir = f"_swarm_artifacts/{run_timestamp}"
         os.makedirs(os.path.join(fs_manager.workspace_path, artifact_dir), exist_ok=True)
         
-        # 2. Transitioning UI to Architect Stage
-        await safe_send(websocket, {"event": "station_update", "station": "origin", "status": "active"})
-        await safe_send(websocket, {
-            "event": "chat", 
-            "sender": "swarm", 
-            "text": f"🧠 **Architect Phase Started** (Budget: ${budget}, Planner: {architect_model})", 
-            "stage": "origin"
-        })
-
-        # 3. Planning (Architect Agent)
         api_key = os.getenv("OPENROUTER_API_KEY")
-        topology = await plan_swarm_dag(message, budget, architect_model, api_key)
-        
-        # 4. Notify UI about the Plan (Topology)
-        await safe_send(websocket, {
-            "event": "topology_update",
-            "topology": topology.dict(),
-            "summary": topology.workflow_summary
-        })
-        
-        fs_manager.write_file(f"{artifact_dir}/topology_plan.json", json.dumps(topology.dict(), indent=2))
-        await safe_send(websocket, {"event": "station_update", "station": "origin", "status": "complete"})
+        previous_results = None
+        retry_count = 0
+        max_retries = 2 # Allow up to 2 repair cycles
+        cumulative_cost = 0.0
 
-        # 5. Execution (DAG Executor)
-        async def node_callback(event):
-            # Map legacy station updates if needed, or send new NODE_STATUS events
-            await safe_send(websocket, event)
-            if event["type"] == "NODE_STATUS" and event["status"] == "completed":
-                # Save partial results
-                n_id = event["node_id"]
-                content = event["content"]
-                fs_manager.write_file(f"{artifact_dir}/node_{n_id}.md", content)
+        while retry_count <= max_retries:
+            # 1. Planning (Architect Agent)
+            await safe_send(websocket, {
+                "event": "chat", 
+                "sender": "swarm", 
+                "text": f"🧠 **Architect Phase Started** (Retry: {retry_count}/{max_retries}) | Planning DAG...", 
+                "stage": "origin"
+            })
+            
+            topology = await plan_swarm_dag(message, budget - cumulative_cost, architect_model, api_key, previous_results)
+            
+            await safe_send(websocket, {
+                "event": "topology_update",
+                "topology": topology.dict(),
+                "summary": topology.workflow_summary
+            })
+            
+            fs_manager.write_file(f"{artifact_dir}/topology_v{retry_count}.json", json.dumps(topology.dict(), indent=2))
 
-        executor = AsyncDAGExecutor(topology, node_callback)
-        report = await executor.run(api_key)
+            # 2. Execution (DAG Executor)
+            async def node_callback(event):
+                await safe_send(websocket, event)
+                if event.get("type") == "NODE_STATUS" and event.get("status") == "completed":
+                    n_id = event["node_id"]
+                    content = event["content"]
+                    fs_manager.write_file(f"{artifact_dir}/node_{n_id}.md", content)
 
-        # 6. Wrap Up
-        final_cost = round(report.final_cost, 4)
+            executor = AsyncDAGExecutor(topology, node_callback)
+            active_executors[websocket] = executor # Store for manual approvals
+            
+            report = await executor.run(api_key)
+            cumulative_cost += report.final_cost
+
+            # 3. Check for Failures (Self-Correction Logic)
+            failed_critical_nodes = [r for r in report.results if r.status == "failed" or (r.node_id.startswith("qa") and "FAIL" in r.content.upper())]
+            
+            if not failed_critical_nodes:
+                # All good!
+                break
+            else:
+                retry_count += 1
+                previous_results = report.results
+                await safe_send(websocket, {
+                    "event": "chat",
+                    "sender": "swarm",
+                    "text": f"⚠️ **Self-Correction Triggered.** Detected {len(failed_critical_nodes)} issues. Requesting Healing DAG from Architect...",
+                    "stage": "origin"
+                })
+
+        # 4. Final Wrap Up
         await safe_send(websocket, {
             "event": "chat",
             "sender": "swarm",
-            "text": f"✅ **Swarm Workflow Complete.**\nFinal Cost: ${final_cost}\nAll nodes resolved successfully.",
+            "text": f"✅ **Swarm Workflow Complete.**\nFinal Cumulative Cost: ${round(cumulative_cost, 4)}",
             "stage": "origin"
         })
         
@@ -575,6 +593,7 @@ async def execute_live_swarm(websocket: WebSocket, message: str, models_dict: di
         await safe_send(websocket, {"event": "workflow_complete"})
     finally:
         active_swarm_tasks.pop(websocket, None)
+        active_executors.pop(websocket, None)
 
 async def run_enterprise_loop(websocket: WebSocket, prompt: str, models: dict, max_tokens: int = 8192):
 
@@ -1324,6 +1343,13 @@ async def websocket_endpoint(websocket: WebSocket):
                     await safe_send(websocket, {"event": "load_profile", "profile": "enterprise", "complexity": 3,
                         "message": f"⚠️ Preview failed ({e}), defaulting to Enterprise."})
                     await safe_send(websocket, {"event": "preview_ready", "profile": "enterprise", "complexity": 3})
+
+            elif command == "approve_node":
+                node_id = data.get("node_id")
+                executor = active_executors.get(websocket)
+                if executor and node_id:
+                    executor.approve_node(node_id)
+                    await safe_send(websocket, {"event": "chat", "sender": "swarm", "text": f"👍 **Approved node {node_id}.** Resuming execution...", "stage": "origin"})
 
             elif command == "swarm_message":
                 msg = data.get("message", "Build something")

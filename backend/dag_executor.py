@@ -15,6 +15,9 @@ class AsyncDAGExecutor:
         self.completion_events: Dict[str, asyncio.Event] = {
             node.node_id: asyncio.Event() for node in topology.planned_nodes
         }
+        self.approval_events: Dict[str, asyncio.Event] = {
+            node.node_id: asyncio.Event() for node in topology.planned_nodes if node.approval_required
+        }
         self.total_cost = 0.0
 
     async def execute_node(self, node: AgentNode, api_key: str):
@@ -25,14 +28,26 @@ class AsyncDAGExecutor:
             logger.info(f"Node {node.node_id} waiting for dependencies: {node.dependencies}")
             await asyncio.gather(*(self.completion_events[dep].wait() for dep in node.dependencies))
         
-        # 2. Gather dependency context
+        # 2. Handle Human-in-the-loop Approval
+        if node.approval_required:
+            logger.info(f"Node {node.node_id} waiting for manual approval.")
+            await self.websocket_callback({
+                "type": "NODE_STATUS",
+                "node_id": node.node_id,
+                "status": "waiting_approval",
+                "message": f"Agent {node.node_id} requires permission to proceed."
+            })
+            await self.approval_events[node.node_id].wait()
+            logger.info(f"Node {node.node_id} approved.")
+
+        # 3. Gather dependency context
         dep_context = ""
         for dep in node.dependencies:
             res = self.results.get(dep)
             if res:
                 dep_context += f"Result from {dep}:\n{res.content}\n\n"
 
-        # 3. Notify frontend - STARTING
+        # 4. Notify frontend - STARTING
         await self.websocket_callback({
             "type": "NODE_STATUS",
             "node_id": node.node_id,
@@ -42,7 +57,7 @@ class AsyncDAGExecutor:
 
         client = openai.AsyncOpenAI(api_key=api_key or os.getenv("OPENROUTER_API_KEY"), base_url="https://openrouter.ai/api/v1")
         
-        # 4. Actual LLM Execution
+        # 5. Actual LLM Execution
         try:
             full_prompt = f"Previous Context:\n{dep_context}\n\nTask:\n{node.prompt}"
             
@@ -53,32 +68,42 @@ class AsyncDAGExecutor:
             )
             
             content = response.choices[0].message.content
-            # OpenRouter cost headers (usage info)
             usage = response.usage
-            # Use estimated pricing if real cost headers aren't available
-            # For now, let's keep it simple.
             
-            # Simple cost tracking based on known model info
-            # In production, we'd use response.usage to be precise.
-            cost = 0.0 # Placeholder, logic in main.py will track this
+            # Precise cost tracking using model info
+            from backend.models_tiering import get_model_info
+            m_info = get_model_info(node.model_id)
+            node_cost = 0.0
+            if m_info and usage:
+                p_in = float(m_info.get("pricing", {}).get("prompt", 0))
+                p_out = float(m_info.get("pricing", {}).get("completion", 0))
+                node_cost = (p_in * usage.prompt_tokens) + (p_out * usage.completion_tokens)
             
+            self.total_cost += node_cost
+            
+            # Emit live cost update
+            await self.websocket_callback({
+                "type": "COST_UPDATE",
+                "total_cost": self.total_cost,
+                "node_cost": node_cost,
+                "node_id": node.node_id
+            })
+
             result = SwarmResult(
                 node_id=node.node_id,
                 content=content,
-                cost=cost,
+                cost=node_cost,
                 status="success"
             )
             self.results[node.node_id] = result
             
-            # 5. Notify frontend - COMPLETED
+            # 6. Notify frontend - COMPLETED
             await self.websocket_callback({
                 "type": "NODE_STATUS",
                 "node_id": node.node_id,
                 "status": "completed",
                 "content": content
             })
-
-            logger.info(f"Node {node.node_id} completed successfully.")
 
         except Exception as e:
             logger.error(f"Node {node.node_id} failed: {str(e)}")
@@ -88,22 +113,30 @@ class AsyncDAGExecutor:
                 "status": "failed",
                 "error": str(e)
             })
-            # Even if it fails, signal completion so DAG doesn't hang
-            self.results[node.node_id] = SwarmResult(node_id=node.node_id, content=f"ERROR: {str(e)}", cost=0.0, status="failed")
+            self.results[node.node_id] = SwarmResult(
+                node_id=node.node_id, 
+                content=f"ERROR: {str(e)}", 
+                cost=0.0, 
+                status="failed",
+                error_log=str(e)
+            )
 
         finally:
             self.completion_events[node.node_id].set()
 
+    def approve_node(self, node_id: str):
+        """Called externally from main.py WebSocket handler."""
+        if node_id in self.approval_events:
+            self.approval_events[node_id].set()
+
     async def run(self, api_key: str) -> SwarmExecutionReport:
         """Runs the entire DAG in parallel."""
-        # Wrap each node execution in a task
         tasks = [asyncio.create_task(self.execute_node(node, api_key)) for node in self.topology.planned_nodes]
-        
         await asyncio.gather(*tasks)
         
         report = SwarmExecutionReport(
             results=list(self.results.values()),
-            final_cost=sum(r.cost for r in self.results.values()),
+            final_cost=self.total_cost,
             complete=True
         )
         return report

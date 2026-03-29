@@ -163,6 +163,8 @@ export function FlowmindIDE({ config = {} }: { config?: SwarmConfig }) {
   const [architectModel, setArchitectModel] = useState("openai/gpt-4o");
   const [topology, setTopology] = useState<{ planned_nodes: any[], workflow_summary: string } | null>(null);
   const [nodeResults, setNodeResults] = useState<Record<string, any>>({});
+  const [runningCost, setRunningCost] = useState(0.0);
+  const [approvalPendingNode, setApprovalPendingNode] = useState<string | null>(null);
 
   const monaco = useMonaco();
 
@@ -426,15 +428,22 @@ export function FlowmindIDE({ config = {} }: { config?: SwarmConfig }) {
         } else if (data.event === "workflow_complete") {
           setIsSimulating(false);
           setChatMessages(prev => [...prev, { role: "agent" as any, content: "Swarm workflow complete! Ready for next task." }]);
+          setApprovalPendingNode(null);
         } else if (data.event === "topology_update") {
           setTopology(data.topology);
           setChatMessages(prev => [...prev, { role: "agent" as any, content: `📊 **Plan Generated:** ${data.summary}` }]);
         } else if (data.type === "NODE_STATUS") {
-          // New dynamic node status updates
           setNodeResults(prev => ({
             ...prev,
-            [data.node_id]: { status: data.status, content: data.content, error: data.error }
+            [data.node_id]: { status: data.status, content: data.content, error: data.error, message: data.message }
           }));
+          if (data.status === "waiting_approval") {
+            setApprovalPendingNode(data.node_id);
+          } else if (data.node_id === approvalPendingNode) {
+            setApprovalPendingNode(null);
+          }
+        } else if (data.type === "COST_UPDATE") {
+          setRunningCost(data.total_cost);
         }
       };
 
@@ -1127,6 +1136,31 @@ export function FlowmindIDE({ config = {} }: { config?: SwarmConfig }) {
 
                       {/* Tab Content */}
                       <div className="flex-1 overflow-hidden relative">
+                        {/* APPROVAL OVERLAY */}
+                        {approvalPendingNode && (
+                          <motion.div 
+                            initial={{ opacity: 0, y: 10 }}
+                            animate={{ opacity: 1, y: 0 }}
+                            className="absolute bottom-4 left-4 right-4 bg-[#fbbf24] p-3 rounded-lg flex items-center justify-between shadow-[0_0_20px_rgba(251,191,36,0.4)] z-50"
+                          >
+                            <div className="flex items-center gap-2">
+                              <Shield className="w-4 h-4 text-black" />
+                              <span className="text-[10px] font-bold text-black uppercase tracking-tight">
+                                Permission Required: node {approvalPendingNode}
+                              </span>
+                            </div>
+                            <button 
+                              onClick={() => {
+                                socketRef.current?.send(JSON.stringify({ command: "approve_node", node_id: approvalPendingNode }));
+                                setApprovalPendingNode(null);
+                              }}
+                              className="bg-black text-[#fbbf24] px-3 py-1.5 rounded text-[10px] font-bold uppercase tracking-widest hover:bg-black/80 transition-colors"
+                            >
+                              Approve
+                            </button>
+                          </motion.div>
+                        )}
+                        
                         {swarmTab === "topology" ? (
                           <div className="absolute inset-0 flex flex-col items-center justify-center p-4">
                             {/* DAG VISUALIZER WRAPPER */}
@@ -1175,9 +1209,9 @@ export function FlowmindIDE({ config = {} }: { config?: SwarmConfig }) {
                                            y={30 + Math.floor(i / 3) * 100} 
                                            width="60" height="40" 
                                            rx="4"
-                                           fill={nodeResults[node.node_id]?.status === 'completed' ? "#34d399" : (nodeResults[node.node_id]?.status === 'executing' ? "#22d3ee" : "#1a1a2e")}
-                                           stroke={nodeResults[node.node_id]?.status === 'executing' ? "#22d3ee" : "#a855f7"}
-                                           strokeWidth="1"
+                                           fill={nodeResults[node.node_id]?.status === 'completed' ? "#34d399" : (nodeResults[node.node_id]?.status === 'waiting_approval' ? "#fbbf24" : (nodeResults[node.node_id]?.status === 'executing' ? "#22d3ee" : "#1a1a2e"))}
+                                           stroke={nodeResults[node.node_id]?.status === 'waiting_approval' ? "#fbbf24" : (nodeResults[node.node_id]?.status === 'executing' ? "#22d3ee" : "#a855f7")}
+                                           strokeWidth={nodeResults[node.node_id]?.status === 'waiting_approval' ? "2" : "1"}
                                          />
                                          <text 
                                            x={100 + (i * 120) % 300} 
@@ -1221,6 +1255,28 @@ export function FlowmindIDE({ config = {} }: { config?: SwarmConfig }) {
                               </div>
                             </div>
                             
+                            <div className="space-y-4 pt-4 border-t border-white/5">
+                              <h3 className="text-[10px] font-bold text-[#34d399] uppercase tracking-[0.2em] flex items-center gap-2">
+                                <Zap className="w-3 h-3" /> Live Cost Ledger
+                              </h3>
+                              <div className="bg-[#1a1a2e] border border-[#34d399]/20 rounded-lg p-3">
+                                <div className="flex justify-between items-center mb-1">
+                                  <span className="text-[9px] text-[#808080] uppercase">Total Tokens Cost</span>
+                                  <span className="text-xs font-mono text-[#34d399] tracking-tighter">${runningCost.toFixed(5)}</span>
+                                </div>
+                                <div className="w-full bg-black/40 h-1 rounded-full overflow-hidden">
+                                  <motion.div 
+                                    className="bg-[#34d399] h-full"
+                                    animate={{ width: `${(runningCost / budget) * 100}%` }}
+                                  />
+                                </div>
+                                <div className="flex justify-between mt-1 text-[7px] text-gray-600 font-mono">
+                                  <span>0%</span>
+                                  <span>BUDGET: ${(runningCost/budget*100).toFixed(1)}%</span>
+                                </div>
+                              </div>
+                            </div>
+
                             <div className="space-y-4 pt-4 border-t border-white/5">
                               <h3 className="text-[10px] font-bold text-[#a855f7] uppercase tracking-[0.2em] flex items-center gap-2">
                                 <Users className="w-3 h-3" /> Architect Model

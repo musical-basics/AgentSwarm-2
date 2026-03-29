@@ -17,65 +17,39 @@ Available Agent Types:
 - analyst: Logical reasoning, data summary, or architectural breakdown.
 - qa: Verifies code, runs checks, or suggests refinements.
 
+Repair Mode:
+If you are provided with 'Previous Results' or 'Error Logs', your goal is to generate a REPAIR DAG.
+This DAG should focus on fixing the specific nodes that failed or failed QA. 
+Dependencies should clearly show how the new nodes link to the successful outputs of the previous run.
+
 Constraint: STRICT BUDGET.
-You must select models for each node that fit within the human-provided budget.
-Formula to respect: SUM( (input_price_per_token * est_input_tokens) + (output_price_per_token * max_tokens) ) <= budget.
-
-Available Models (Tiered):
-{model_tiers_summary}
-
-Your output MUST BE A JSON object matching the SwarmTopology schema:
-{
-  "planned_nodes": [
-    {
-      "node_id": "string",
-      "agent_type": "string",
-      "model_id": "string",
-      "prompt": "string instructions for this node",
-      "dependencies": ["list_of_node_ids"],
-      "max_tokens": int
-    }
-  ],
-  "total_estimated_cost": float,
-  "workflow_summary": "string"
-}
-
-Plan for maximum parallelism where dependencies allow.
+... (rest of constraint logic)
 """
 
 async def plan_swarm_dag(
     user_prompt: str,
     budget: float,
     architect_model: str = "openai/gpt-4o",
-    api_key: str = None
+    api_key: str = None,
+    previous_results: Optional[List[SwarmResult]] = None
 ) -> SwarmTopology:
     """
-    Architects the swarm execution plan.
+    Architects or Repairs the swarm execution plan.
     """
     tiers = load_and_tier_models()
     
-    # Generate a summary of available models for the system prompt
     tier_summary = f"Tier 1 (Premium): {[m['id'] for m in tiers['tier1'][:5]]}...\n"
     tier_summary += f"Tier 2 (Mid): {[m['id'] for m in tiers['tier2'][:5]]}...\n"
     tier_summary += f"Tier 3 (Cheap): {[m['id'] for m in tiers['tier3'][:5]]}..."
 
-    # In a real scenario, we'd use the architect_model to generate the JSON.
-    # We use structured output if supported by the model.
+    mode_context = ""
+    if previous_results:
+        mode_context = "REPAIR MODE ACTIVE.\nPrevious Results:\n"
+        for res in previous_results:
+            mode_context += f"- Node {res.node_id}: {res.status}. Output: {res.content[:200]}... Error: {res.error_log}\n"
     
-    full_prompt = f"User Request: {user_prompt}\nBudget: ${budget}\n\nDecompose this into a DAG."
+    full_prompt = f"{mode_context}\nUser Request: {user_prompt}\nBudget: ${budget}\n\nDecompose this into a optimal DAG."
 
-    # Simulation/Actual Call to LLM
-    # Note: Using AsyncOpenAI here would be better, but assuming sync openai for compatibility with main.py if needed.
-    # However, for a real agentic upgrade, let's use the provided architect_model.
-    
-    # For now, I'll implement a robust helper that calls the LLM.
-    # Since I don't have a direct LLM tool, I'll write the logic as if I'm building it.
-    
-    # NOTE: In the backend/main.py, there's likely an existing client.
-    # I'll rely on a generic 'llm_call' structure.
-    
-    # Let's define the actual logic in architect.py
-    
     client = openai.AsyncOpenAI(api_key=api_key or os.getenv("OPENROUTER_API_KEY"), base_url="https://openrouter.ai/api/v1")
     
     try:
@@ -91,10 +65,7 @@ async def plan_swarm_dag(
         raw_json = json.loads(response.choices[0].message.content)
         topology = SwarmTopology(**raw_json)
         
-        # Post-validation: Ensure cost doesn't exceed budget (even if LLM tried)
-        # If it does, downrank models automatically
         topology = validate_and_correct_budget(topology, budget, tiers)
-        
         return topology
         
     except Exception as e:

@@ -8,6 +8,8 @@ class AgentNode(BaseModel):
     prompt: str = Field(..., description="Specific instructions for this agent node")
     dependencies: List[str] = Field(default_factory=list, description="List of node_ids this agent depends on")
     max_tokens: int = Field(default=2000, description="Token limit for this specific agent call")
+    approval_required: bool = Field(default=False, description="Pause execution until human approves")
+    critical: bool = Field(default=True, description="If True, failure triggers re-planning/repair")
 
 class SwarmTopology(BaseModel):
     planned_nodes: List[AgentNode] = Field(..., description="Execution sequence of agents in the DAG")
@@ -19,6 +21,7 @@ class SwarmResult(BaseModel):
     content: str
     cost: float
     status: str = "success"
+    error_log: Optional[str] = None
 
 class SwarmExecutionReport(BaseModel):
     results: List[SwarmResult]
