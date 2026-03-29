@@ -24,10 +24,11 @@ You must mathematically approximate the budget to ensure feasibility.
 
 CRITICAL DIRECTIVES:
 1. C_total MUST BE <= ${{user_budget_usd}}.
-2. CAPABILITIES: Set `requires_tools: True` if the node needs tool use. Set `requires_search: True` if the node needs real-time research.
+2. CAPABILITIES: Set `requires_tools: True` if the node needs tool use. Set `requires_search: True` if the node needs real-time research (weather, news, prices, live data).
 3. Route trivial tasks to Tier 3/2. Route heavy coding/analyst to Tier 1.
-4. If a task requires Search but fits no search-capable model within budget, prefer a cheap search-capable model over a non-searching one, OR output an 'error' node with a BUDGET_CONSTRAINT warning.
-5. If the budget is mathematically impossible for the required tasks, output a single step named 'error' explaining the budget deficit.
+4. SEARCH NODES: If `requires_search` is True, the model executor will AUTOMATICALLY provide a search-capable system prompt. However, YOU must write the `prompt` field to start with an explicit action: e.g. "Search the web for the current weather in Tokyo and report..." — do NOT write vague prompts like "find weather data".
+5. If a task requires Search but fits no search-capable model within budget, prefer a cheap search-capable model over a non-searching one, OR output an 'error' node with a BUDGET_CONSTRAINT warning.
+6. If the budget is mathematically impossible for the required tasks, output a single step with agent_type="error_handler" explaining the budget deficit. Keep it under 30 words.
 
 OUTPUT SCHEMA (STRICT JSON):
 {{
@@ -39,7 +40,7 @@ OUTPUT SCHEMA (STRICT JSON):
             "agent_type": "researcher",
             "model_id": "provider/model-name",
             "max_tokens": 2000,
-            "prompt": "Specific instructions for this node",
+            "prompt": "Search the web for [specific query]... then summarize...",
             "dependencies": [],
             "approval_required": false,
             "critical": true,

@@ -41,7 +41,9 @@ def load_and_tier_models(file_path: Optional[str] = None) -> Dict[str, List[Dict
         # Capability tags
         params = m.get("supported_parameters", [])
         m["has_tools"] = "tools" in params
-        m["has_search"] = pricing.get("web_search") is not None or "search" in m.get("description", "").lower()
+        # Only trust the authoritative `web_search` pricing key for search capability.
+        # Description keyword matching creates too many false positives (safety models, code search, etc.)
+        m["has_search"] = pricing.get("web_search") is not None
         
         # High Tier: > $5 per 1M tokens ($0.000005)
         if p_in >= 0.000005: # Changed to >= to catch $5 exactly
@@ -74,7 +76,7 @@ def get_model_info(model_id: str, file_path: Optional[str] = None) -> Optional[D
             pricing = m.get("pricing", {})
             params = m.get("supported_parameters", [])
             m["has_tools"] = "tools" in params
-            m["has_search"] = pricing.get("web_search") is not None or "search" in m.get("description", "").lower()
+            m["has_search"] = pricing.get("web_search") is not None
             
             # Add tier info too
             p_in = float(pricing.get("prompt", 0))
@@ -89,6 +91,11 @@ def get_optimal_model(tier: int, min_context: int, tiers: Dict[str, List[Dict[st
     """
     Finds the best model in a tier that satisfies the context requirement and capabilities.
     required_capabilities: list of strings like ["has_tools", "has_search"]
+    
+    When capabilities are required (e.g. has_search), the function will:
+    1. Look in the requested tier first for a capable model
+    2. If not found, search ALL tiers and return cheapest capable model
+    3. This means a search-required node will never fall back to a non-searching model
     """
     tier_key = f"tier{tier}"
     tier_models = tiers.get(tier_key, [])
@@ -96,29 +103,36 @@ def get_optimal_model(tier: int, min_context: int, tiers: Dict[str, List[Dict[st
     candidates = [m for m in tier_models if m.get("context_length", 0) >= min_context]
     
     if required_capabilities:
-        candidates = [
+        capable_candidates = [
             m for m in candidates 
             if all(m.get(cap, False) for cap in required_capabilities)
         ]
+        
+        if not capable_candidates:
+            # No capable model in this tier — search ALL tiers for cheapest capable model
+            all_models = tiers.get("tier1", []) + tiers.get("tier2", []) + tiers.get("tier3", [])
+            all_capable = [
+                m for m in all_models 
+                if all(m.get(cap, False) for cap in required_capabilities)
+                and m.get("context_length", 0) >= min_context
+            ]
+            if all_capable:
+                # Pick cheapest capable model across all tiers
+                all_capable.sort(key=lambda x: float(x.get("pricing", {}).get("prompt", 0)))
+                return all_capable[0]["id"]
+            # No capable model exists at all — ultimate fallback
+            return "openai/gpt-4o"
+        
+        # Prefer cheapest capable model within budget tier
+        capable_candidates.sort(key=lambda x: float(x.get("pricing", {}).get("prompt", 0)))
+        return capable_candidates[0]["id"]
     
     if not candidates:
-        # Fallback to higher tier if empty or lower tier if higher tier requested
+        # No context-length match in this tier — escalate to tier 1 (most capable)
         if tier > 1:
             return get_optimal_model(tier - 1, min_context, tiers, required_capabilities)
-        # If still no candidates and capabilities were requested, try ignoring tier if we can find ANY model
-        if required_capabilities and tier == 1:
-            # Last ditch effort: search all tiers for a capable model
-            all_models = tiers["tier1"] + tiers["tier2"] + tiers["tier3"]
-            cap_candidates = [
-                m for m in all_models 
-                if all(m.get(cap, False) for cap in required_capabilities) and m.get("context_length", 0) >= min_context
-            ]
-            if cap_candidates:
-                cap_candidates.sort(key=lambda x: float(x.get("pricing", {}).get("prompt", 0)))
-                return cap_candidates[0]["id"]
-                
-        return "openai/gpt-4o" # Ultimate fallback
+        return "openai/gpt-4o"  # Ultimate fallback
 
-    # Sort by context length descending within the tier
+    # No capability requirements — sort by context length descending (most capable first within tier)
     candidates.sort(key=lambda x: x.get("context_length", 0), reverse=True)
     return candidates[0]["id"]

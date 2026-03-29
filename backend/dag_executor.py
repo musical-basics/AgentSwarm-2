@@ -1,4 +1,5 @@
 import asyncio
+import os
 import uuid
 import logging
 from typing import List, Dict, Any, Callable, Coroutine
@@ -55,15 +56,55 @@ class AsyncDAGExecutor:
             "agent_type": node.agent_type
         })
 
+        # FIX 2: Error handler nodes short-circuit — never call the LLM
+        # The Architect's error message IS the final answer. No LLM needed.
+        if node.agent_type == "error_handler":
+            logger.warning(f"Node {node.node_id} is an error_handler. Short-circuiting LLM call.")
+            self.results[node.node_id] = SwarmResult(
+                node_id=node.node_id,
+                content=f"⛔ Budget Error: {node.prompt}",
+                cost=0.0,
+                status="failed",
+                error_log="Budget constraint detected by Architect."
+            )
+            await self.websocket_callback({
+                "type": "NODE_STATUS",
+                "node_id": node.node_id,
+                "status": "failed",
+                "content": f"⛔ Budget Error: {node.prompt}"
+            })
+            self.completion_events[node.node_id].set()
+            return
+
         client = openai.AsyncOpenAI(api_key=api_key or os.getenv("OPENROUTER_API_KEY"), base_url="https://openrouter.ai/api/v1")
+        
+        # FIX 3: Build search-aware system prompt
+        if node.requires_search:
+            system_prompt = (
+                "You are a live research specialist with real-time web search capability. "
+                "You MUST use your search tool to find current, up-to-date information before responding. "
+                "Do NOT say you lack access to real-time data. Search the web right now and provide actual current results."
+            )
+        elif node.requires_tools:
+            system_prompt = (
+                "You are an expert AI assistant with access to tools and APIs. "
+                "Use your available tools to fulfill the task accurately."
+            )
+        else:
+            system_prompt = "You are a specialist AI agent. Complete the assigned task thoroughly and accurately."
         
         # 5. Actual LLM Execution
         try:
             full_prompt = f"Previous Context:\n{dep_context}\n\nTask:\n{node.prompt}"
+            if node.requires_search:
+                full_prompt += "\n\n[SEARCH REQUIRED: Use real-time web search to answer this query.]"
             
             response = await client.chat.completions.create(
                 model=node.model_id,
-                messages=[{"role": "user", "content": full_prompt}],
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": full_prompt}
+                ],
                 max_tokens=node.max_tokens
             )
             
