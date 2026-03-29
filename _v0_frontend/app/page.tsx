@@ -1,4 +1,4 @@
-import { FlowmindIDE } from "@agentswarm/shared-swarm/flowmind";
+import { FlowmindIDE } from "../components/local-flowmind/flowmind-ide";
 
 export default function Page() {
   return (

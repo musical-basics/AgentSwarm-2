@@ -8,6 +8,16 @@ from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
 import httpx
+import struct
+import fcntl
+import termios
+import signal
+import datetime
+
+# Logic Architect Imports
+from backend.architect import plan_swarm_dag
+from backend.dag_executor import AsyncDAGExecutor
+from backend.models_tiering import load_and_tier_models
 
 DOTENV_PATH = os.path.join(os.path.dirname(__file__), ".env.local")
 load_dotenv(DOTENV_PATH)
@@ -499,33 +509,64 @@ async def classify_intent(prompt: str, model_id: str) -> tuple[str, int]:
         return "sniper", 1
     return "enterprise", 3
 
-async def execute_live_swarm(websocket: WebSocket, message: str, models_dict: dict = None):
+async def execute_live_swarm(websocket: WebSocket, message: str, models_dict: dict = None, budget: float = 0.5, architect_model: str = "openai/gpt-4o"):
     try:
-        # Light up origin
-        await safe_send(websocket,{"event": "workflow_start", "message": message})
-        await safe_send(websocket,{"event": "station_update", "station": "origin", "status": "active"})
+        # 1. Reset & Metadata
+        await safe_send(websocket, {"event": "workflow_start", "message": message})
         
-        # Dispatch: classify and get token budget
-        origin_model = normalize_models_dict(models_dict, 3).get("origin", "google/gemini-2.5-flash") if models_dict else "google/gemini-2.5-flash"
-        profile, complexity = await classify_intent(message, origin_model)
-        max_tokens = COMPLEXITY_BUDGETS[complexity]
+        run_timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        artifact_dir = f"_swarm_artifacts/{run_timestamp}"
+        os.makedirs(os.path.join(fs_manager.workspace_path, artifact_dir), exist_ok=True)
         
-        logging.info(f"[Dispatcher] Profile={profile}, Complexity={complexity}, MaxTokens={max_tokens}")
-        
+        # 2. Transitioning UI to Architect Stage
+        await safe_send(websocket, {"event": "station_update", "station": "origin", "status": "active"})
         await safe_send(websocket, {
-            "event": "load_profile", 
-            "profile": profile,
-            "complexity": complexity,
-            "message": f"🎯 Dispatcher → **{profile.upper()}** pipeline | Complexity {complexity}/3 | Token budget: {max_tokens:,}"
+            "event": "chat", 
+            "sender": "swarm", 
+            "text": f"🧠 **Architect Phase Started** (Budget: ${budget}, Planner: {architect_model})", 
+            "stage": "origin"
+        })
+
+        # 3. Planning (Architect Agent)
+        api_key = os.getenv("OPENROUTER_API_KEY")
+        topology = await plan_swarm_dag(message, budget, architect_model, api_key)
+        
+        # 4. Notify UI about the Plan (Topology)
+        await safe_send(websocket, {
+            "event": "topology_update",
+            "topology": topology.dict(),
+            "summary": topology.workflow_summary
         })
         
-        if profile == "sniper":
-            await run_sniper_loop(websocket, message, normalize_models_dict(models_dict, complexity), max_tokens)
-        elif profile == "newsroom":
-            await run_newsroom_loop(websocket, message, normalize_models_dict(models_dict, complexity), max_tokens)
-        else:
-            await run_enterprise_loop(websocket, message, normalize_models_dict(models_dict, complexity), max_tokens)
-            
+        fs_manager.write_file(f"{artifact_dir}/topology_plan.json", json.dumps(topology.dict(), indent=2))
+        await safe_send(websocket, {"event": "station_update", "station": "origin", "status": "complete"})
+
+        # 5. Execution (DAG Executor)
+        async def node_callback(event):
+            # Map legacy station updates if needed, or send new NODE_STATUS events
+            await safe_send(websocket, event)
+            if event["type"] == "NODE_STATUS" and event["status"] == "completed":
+                # Save partial results
+                n_id = event["node_id"]
+                content = event["content"]
+                fs_manager.write_file(f"{artifact_dir}/node_{n_id}.md", content)
+
+        executor = AsyncDAGExecutor(topology, node_callback)
+        report = await executor.run(api_key)
+
+        # 6. Wrap Up
+        final_cost = round(report.final_cost, 4)
+        await safe_send(websocket, {
+            "event": "chat",
+            "sender": "swarm",
+            "text": f"✅ **Swarm Workflow Complete.**\nFinal Cost: ${final_cost}\nAll nodes resolved successfully.",
+            "stage": "origin"
+        })
+        
+        files = fs_manager.list_files()
+        await safe_send(websocket, {"event": "file_list", "files": files, "workspace_name": os.path.basename(fs_manager.workspace_path)})
+        await safe_send(websocket, {"event": "workflow_complete"})
+        
     except asyncio.CancelledError:
         logging.info("Swarm execution cancelled by user")
     except Exception as e:
@@ -1287,13 +1328,15 @@ async def websocket_endpoint(websocket: WebSocket):
             elif command == "swarm_message":
                 msg = data.get("message", "Build something")
                 models_dict = data.get("models", {})
+                budget = float(data.get("budget", 0.5))
+                architect_model = data.get("architectModel", "openai/gpt-4o")
                 
                 # Cancel any existing task for this websocket before starting a new one
                 old_task = active_swarm_tasks.get(websocket)
                 if old_task and not old_task.done():
                     old_task.cancel()
                     
-                task = asyncio.create_task(execute_live_swarm(websocket, msg, models_dict))
+                task = asyncio.create_task(execute_live_swarm(websocket, msg, models_dict, budget, architect_model))
                 active_swarm_tasks[websocket] = task
 
             elif command == "kill_swarm":
