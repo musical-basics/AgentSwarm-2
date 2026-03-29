@@ -764,7 +764,7 @@ export function FlowmindIDE({ config = {} }: { config?: SwarmConfig }) {
               <FolderOpen className="w-3.5 h-3.5" />
             </button>
           </div>
-          <div className="flex-1 overflow-auto px-1 py-2 relative" onClick={() => setContextMenu(null)}>
+          <div className="flex-1 overflow-auto px-1 py-2 relative" onClick={(e) => { if (e.button === 0) setContextMenu(null); }}>
             <FileTree
               items={files}
               selectedFile={selectedFile}
@@ -1464,7 +1464,7 @@ function FileTree({
               <>
                 <motion.button
                   onClick={() => onToggleFolder(currentPath)}
-                  onContextMenu={(e) => onContextMenu?.(e, backendPath, true)}
+                  onContextMenu={(e) => { e.preventDefault(); e.stopPropagation(); onContextMenu?.(e, backendPath, true); }}
                   className="flex items-center gap-1.5 w-full px-2 py-1.5 rounded text-left hover:bg-[#22d3ee]/10 transition-colors group"
                   whileHover={{ x: 2 }}
                 >
@@ -1512,7 +1512,7 @@ function FileTree({
             ) : (
               <motion.button
                 onClick={() => { if (!isRenaming) onSelectFile(backendPath); }}
-                onContextMenu={(e) => onContextMenu?.(e, backendPath, false)}
+                onContextMenu={(e) => { e.preventDefault(); e.stopPropagation(); onContextMenu?.(e, backendPath, false); }}
                 className={`flex items-center gap-1.5 w-full px-2 py-1.5 rounded text-left ml-4 transition-all ${
                   selectedFile === backendPath
                     ? "bg-[#22d3ee]/20 border border-[#22d3ee]/40"
