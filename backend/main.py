@@ -13,6 +13,13 @@ import fcntl
 import termios
 import signal
 import datetime
+import sys
+
+# Ensure the parent directory is in sys.path so that 'from backend.xxx' imports work
+current_dir = os.path.dirname(os.path.abspath(__file__))
+parent_dir = os.path.dirname(current_dir)
+if parent_dir not in sys.path:
+    sys.path.insert(0, parent_dir)
 
 # Logic Architect Imports
 from backend.architect import plan_swarm_dag
