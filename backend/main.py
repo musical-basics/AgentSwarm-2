@@ -1,5 +1,6 @@
 import asyncio
 import os
+import threading
 import uvicorn
 import logging
 import json
@@ -102,6 +103,14 @@ logging.basicConfig(
 )
 
 app = FastAPI()
+
+# Captured at startup — used by WorkspaceWatcher to safely schedule broadcasts from its background thread.
+_main_event_loop: asyncio.AbstractEventLoop | None = None
+
+@app.on_event("startup")
+async def _capture_event_loop():
+    global _main_event_loop
+    _main_event_loop = asyncio.get_running_loop()
 
 app.add_middleware(
     CORSMiddleware,
@@ -278,18 +287,21 @@ class WorkspaceWatcher(FileSystemEventHandler):
     def on_any_event(self, event):
         if event.is_directory or "___" in event.src_path or ".DS_Store" in event.src_path:
             return
-        
-        # Debounce broadcast
+
+        # Debounce: cancel any pending timer before scheduling a new one.
+        # threading.Timer is used because this callback runs on the watchdog thread,
+        # not the asyncio event loop thread — loop.call_later is NOT thread-safe here.
         if self._timer:
             self._timer.cancel()
-        
-        # Get active running loop safely
-        try:
-            loop = asyncio.get_running_loop()
-            self._timer = loop.call_later(0.3, lambda: asyncio.create_task(self.broadcast()))
-        except RuntimeError:
-            pass
-            
+        self._timer = threading.Timer(0.3, self._schedule_broadcast)
+        self._timer.daemon = True
+        self._timer.start()
+
+    def _schedule_broadcast(self):
+        # Bridge from watchdog thread into the asyncio event loop thread.
+        if _main_event_loop and not _main_event_loop.is_closed():
+            asyncio.run_coroutine_threadsafe(self.broadcast(), _main_event_loop)
+
     async def broadcast(self):
         try:
             files = fs_manager.list_files()
@@ -755,6 +767,11 @@ async def execute_ab_test(
             },
         }
         fs_manager.write_file(f"{ab_dir}/ab_result.json", json.dumps(result_payload, indent=2))
+
+        # Explicitly refresh the file tree — the watchdog runs on a background thread
+        # and may lag; an authoritative push here ensures the UI reflects new artifacts immediately.
+        files = fs_manager.list_files()
+        await safe_send(websocket, {"event": "file_list", "files": files, "workspace_name": os.path.basename(fs_manager.workspace_path)})
 
         await safe_send(
             websocket,
