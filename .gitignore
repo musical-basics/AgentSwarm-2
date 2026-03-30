@@ -1,0 +1,12 @@
+# Python bytecode/cache
+__pycache__/
+*.py[cod]
+
+# Runtime logs
+*.log
+
+# Local generated artifacts
+_swarm_artifacts/
+backend/_swarm_artifacts/
+20260329-*/
+_backup_files/
