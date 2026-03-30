@@ -5,6 +5,50 @@ from typing import List, Dict, Any, Optional
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Model quality controls
+# ---------------------------------------------------------------------------
+
+# Models excluded from all selections — known low quality, broken pricing,
+# or unreliable inference. Add model IDs here to ban them globally.
+MODEL_BLACKLIST: frozenset = frozenset({
+    "reka/reka-edge",           # Produces garbled/halluincated outputs
+    "openrouter/free",          # Generic catch-all, unpredictable quality
+    "openrouter/bodybuilder",   # Negative pricing — broken entry
+    # Free-tier variants: inconsistent availability, no SLA
+    "nvidia/nemotron-3-super-120b-a12b:free",
+    "minimax/minimax-m2.5:free",
+    "stepfun/step-3.5-flash:free",
+    "arcee-ai/trinity-large-preview:free",
+    "liquid/lfm-2.5-1.2b-thinking:free",
+    "liquid/lfm-2.5-1.2b-instruct:free",
+    "arcee-ai/trinity-mini:free",
+    "nvidia/nemotron-3-nano-30b-a3b:free",
+})
+
+# Preferred models per tier, ordered by priority (first match wins).
+# These are checked before falling back to cheapest/largest-context sorting.
+# Criteria: known reliability + high value-to-cost ratio.
+MODEL_PREFERRED: list = [
+    # --- Tier 1 (>$5/M) ---
+    "anthropic/claude-opus-4.6",        # 1M ctx, best-in-class quality
+    "openai/gpt-5.4-pro",               # Strong general + coding
+    # --- Tier 2 (>$0.50/M) ---
+    "anthropic/claude-sonnet-4.6",      # 1M ctx, excellent quality/cost
+    "google/gemini-2.5-pro",            # 1M ctx, strong reasoning
+    "openai/gpt-5.4-mini",              # 400k ctx, reliable mid-tier
+    "qwen/qwen3-max-thinking",          # 262k ctx, strong reasoning budget
+    # --- Tier 3 (≤$0.50/M) ---
+    "deepseek/deepseek-v3.2",           # $0.26/M, strong coding + reasoning
+    "x-ai/grok-4.1-fast",              # $0.20/M, 2M ctx, very capable
+    "qwen/qwen3.5-flash-02-23",         # $0.065/M, 1M ctx, highest value score
+    "google/gemini-2.0-flash-001",      # $0.10/M, 1M ctx, reliable
+    "openai/gpt-4.1-nano",              # $0.10/M, 1M ctx, solid nano
+    "meta-llama/llama-4-maverick",      # $0.15/M, 1M ctx, strong open model
+]
+
+# ---------------------------------------------------------------------------
+
 def get_fallback_path():
     """Returns the absolute path to fallback_models.json."""
     base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__))) # Root of AgentSwarm-2
@@ -107,7 +151,8 @@ def get_optimal_model(
     2. If not found, search ALL tiers and return cheapest capable model
     3. This means a search-required node will never fall back to a non-searching model
     """
-    excluded_id_set = set(excluded_model_ids or [])
+    # Always merge the global blacklist into the excluded set
+    excluded_id_set = set(excluded_model_ids or []) | MODEL_BLACKLIST
     excluded_prefix_tuple = tuple(excluded_prefixes or [])
 
     def _is_allowed(model: Dict[str, Any]) -> bool:
@@ -142,13 +187,23 @@ def get_optimal_model(
                 and _is_allowed(m)
             ]
             if all_capable:
-                # Pick cheapest capable model across all tiers
+                # Check preferred list first, then fall back to cheapest
+                all_capable_ids = {m["id"] for m in all_capable}
+                for preferred_id in MODEL_PREFERRED:
+                    if preferred_id in all_capable_ids:
+                        return preferred_id
                 all_capable.sort(key=lambda x: float(x.get("pricing", {}).get("prompt", 0)))
                 return all_capable[0]["id"]
             # No capable model exists at all — ultimate fallback
             return "openai/gpt-4o"
         
-        # Prefer cheapest capable model within budget tier
+        # Check preferred list first among capable candidates in this tier
+        capable_ids = {m["id"] for m in capable_candidates}
+        for preferred_id in MODEL_PREFERRED:
+            if preferred_id in capable_ids:
+                return preferred_id
+
+        # Fall back to cheapest capable model within tier
         capable_candidates.sort(key=lambda x: float(x.get("pricing", {}).get("prompt", 0)))
         return capable_candidates[0]["id"]
     
@@ -165,6 +220,12 @@ def get_optimal_model(
             )
         return "openai/gpt-4o"  # Ultimate fallback
 
-    # No capability requirements — sort by context length descending (most capable first within tier)
+    # Check preferred list first among candidates in this tier
+    candidate_ids = {m["id"] for m in candidates}
+    for preferred_id in MODEL_PREFERRED:
+        if preferred_id in candidate_ids:
+            return preferred_id
+
+    # Fall back to largest context model in tier
     candidates.sort(key=lambda x: x.get("context_length", 0), reverse=True)
     return candidates[0]["id"]

@@ -73,9 +73,9 @@ async def plan_swarm_dag(
         p_out = float(m.get('pricing', {}).get('completion', 0)) * 1_000_000
         return f"{m['id']} (${p_in:.3f}/M in, ${p_out:.3f}/M out)"
     
-    tier_summary = f"Tier 1 (Premium, >$5/M): {[_fmt_model(m) for m in tiers['tier1'][:3]]}\n"
-    tier_summary += f"Tier 2 (Mid, >$0.50/M): {[_fmt_model(m) for m in tiers['tier2'][:3]]}\n"
-    tier_summary += f"Tier 3 (Cheap, <=$0.50/M): {[_fmt_model(m) for m in tiers['tier3'][:5]]}"
+    tier_summary = f"Tier 1 (Premium, >$5/M): {[_fmt_model(m) for m in tiers['tier1']]}\n"
+    tier_summary += f"Tier 2 (Mid, >$0.50/M): {[_fmt_model(m) for m in tiers['tier2']]}\n"
+    tier_summary += f"Tier 3 (Cheap, <=$0.50/M): {[_fmt_model(m) for m in tiers['tier3']]}"
 
     mode_context = ""
     if previous_results:
@@ -144,6 +144,38 @@ def validate_and_correct_budget(
         return total
 
     banned_model_ids = banned_model_ids or set()
+
+    # Agent-type minimum tier floors: QA, coder, and analyst must use at least Tier 2.
+    # This prevents cheap/edge models from being assigned to tasks requiring reasoning.
+    AGENT_MIN_TIER = {
+        "coder": 2,
+        "qa": 2,
+        "analyst": 2,
+    }
+
+    for node in topology.planned_nodes:
+        min_tier = AGENT_MIN_TIER.get((node.agent_type or "").lower())
+        if min_tier is not None:
+            current_info = get_model_info(node.model_id)
+            current_tier = current_info.get("tier", 3) if current_info else 3
+            if current_tier > min_tier:
+                caps = []
+                if node.requires_tools: caps.append("has_tools")
+                if node.requires_search: caps.append("has_search")
+                upgraded = get_optimal_model(
+                    min_tier,
+                    8192,
+                    tiers,
+                    required_capabilities=caps,
+                    excluded_model_ids=list(banned_model_ids),
+                    excluded_prefixes=list(SEARCH_UNSAFE_MODEL_PREFIXES if node.requires_search else ()),
+                )
+                if upgraded != node.model_id:
+                    logger.info(
+                        f"Tier floor upgrade for {node.node_id} ({node.agent_type}): "
+                        f"{node.model_id} (tier {current_tier}) -> {upgraded} (tier {min_tier})"
+                    )
+                    node.model_id = upgraded
 
     # Enforce per-run model restrictions before budget optimization.
     for node in topology.planned_nodes:

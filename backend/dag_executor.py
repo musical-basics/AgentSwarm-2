@@ -110,7 +110,8 @@ class AsyncDAGExecutor:
 
         client = openai.AsyncOpenAI(api_key=api_key or os.getenv("OPENROUTER_API_KEY"), base_url="https://openrouter.ai/api/v1")
         
-        # Build search-aware system prompt
+        # Build role-aware system prompt
+        agent_type_lower = (node.agent_type or "").lower()
         if node.requires_search:
             system_prompt = (
                 "You are a live research specialist. Real-time web search results will be injected into your context "
@@ -121,6 +122,31 @@ class AsyncDAGExecutor:
             system_prompt = (
                 "You are an expert AI assistant with access to tools and APIs. "
                 "Use your available tools to fulfill the task accurately."
+            )
+        elif agent_type_lower == "qa":
+            system_prompt = (
+                "You are a specialist QA engineer. You will receive code, a regex, or a piece of logic produced by a previous agent. "
+                "Your job is to rigorously test it against edge cases. "
+                "Write a correct, runnable test script and list each test case with PASS or FAIL. "
+                "Be precise: do not invent test inputs that cannot be derived from the task. "
+                "If you cannot run the code, reason through each case step by step and state your conclusion explicitly."
+            )
+        elif agent_type_lower == "coder":
+            system_prompt = (
+                "You are an expert software engineer. Write clean, correct, production-quality code. "
+                "Follow best practices for the language and domain. Include concise inline comments where non-obvious. "
+                "Do not add placeholder logic — every function must be fully implemented."
+            )
+        elif agent_type_lower == "analyst":
+            system_prompt = (
+                "You are a senior data analyst. Analyze the inputs provided and produce a structured, evidence-based summary. "
+                "Use bullet points, tables, or numbered lists where appropriate. "
+                "Separate facts from inferences. Highlight any gaps or caveats clearly."
+            )
+        elif agent_type_lower == "researcher":
+            system_prompt = (
+                "You are a thorough research analyst. Gather and synthesize information from the provided context. "
+                "Structure your findings clearly with headings. Cite sources or note when information is inferred."
             )
         else:
             system_prompt = "You are a specialist AI agent. Complete the assigned task thoroughly and accurately."
