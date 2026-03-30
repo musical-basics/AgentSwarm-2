@@ -85,7 +85,7 @@ if parent_dir not in sys.path:
 # Logic Architect Imports
 from backend.architect import plan_swarm_dag
 from backend.dag_executor import AsyncDAGExecutor
-from backend.models_tiering import load_and_tier_models
+from backend.models_tiering import load_and_tier_models, get_model_info, get_optimal_model
 
 DOTENV_PATH = os.path.join(os.path.dirname(__file__), ".env.local")
 load_dotenv(DOTENV_PATH)
@@ -596,6 +596,61 @@ async def execute_live_swarm(websocket: WebSocket, message: str, models_dict: di
         retry_count = 0
         max_retries = 2 # Allow up to 2 repair cycles
         cumulative_cost = 0.0
+        failed_model_ids = set()
+        search_unsafe_prefixes = ("reka/",)
+
+        def infer_requested_file_name(default_node_id: str, language_hint: str = "") -> str:
+            explicit = re.search(r"\b([A-Za-z0-9_\-]+\.(?:py|js|ts|tsx|jsx|java|go|rs|cpp|c|cs|rb|php|swift|kt|sql|sh|html|css|json|ya?ml|md))\b", message)
+            if explicit:
+                return explicit.group(1)
+
+            lang = (language_hint or "").strip().lower()
+            ext_map = {
+                "python": ".py",
+                "py": ".py",
+                "javascript": ".js",
+                "js": ".js",
+                "typescript": ".ts",
+                "ts": ".ts",
+                "tsx": ".tsx",
+                "jsx": ".jsx",
+                "bash": ".sh",
+                "sh": ".sh",
+                "sql": ".sql",
+                "html": ".html",
+                "css": ".css",
+                "json": ".json",
+                "yaml": ".yaml",
+                "yml": ".yml",
+            }
+
+            msg = message.lower()
+            inferred_ext = ext_map.get(lang)
+            if not inferred_ext:
+                if "python" in msg:
+                    inferred_ext = ".py"
+                elif "typescript" in msg:
+                    inferred_ext = ".ts"
+                elif "javascript" in msg:
+                    inferred_ext = ".js"
+                elif "sql" in msg:
+                    inferred_ext = ".sql"
+                elif "bash" in msg or "shell" in msg:
+                    inferred_ext = ".sh"
+                else:
+                    inferred_ext = ".txt"
+
+            return f"node_{default_node_id}_output{inferred_ext}"
+
+        def extract_best_code_block(content: str):
+            if not content:
+                return None, ""
+            matches = re.findall(r"```([a-zA-Z0-9_+-]*)\n([\s\S]*?)```", content)
+            if not matches:
+                return None, ""
+            # Prefer the largest block; LLMs often put the complete file in the longest fenced block.
+            language, code = max(matches, key=lambda m: len(m[1] or ""))
+            return code.strip(), (language or "").strip()
 
         # --- Chat log accumulator ---
         chat_log_lines = [
@@ -628,7 +683,40 @@ async def execute_live_swarm(websocket: WebSocket, message: str, models_dict: di
             })
             append_chat_log("🧠 Architect", arch_msg, f"retry={retry_count}")
             
-            topology = await plan_swarm_dag(message, budget - cumulative_cost, architect_model, api_key, previous_results)
+            topology = await plan_swarm_dag(
+                message,
+                budget - cumulative_cost,
+                architect_model,
+                api_key,
+                previous_results,
+                failed_model_ids,
+            )
+
+            # Runtime hardening: avoid search-unsafe providers and give coder nodes room to return complete files.
+            tiers = load_and_tier_models()
+            for node in topology.planned_nodes:
+                if node.agent_type in {"coder", "coding"} and node.max_tokens < 3000:
+                    node.max_tokens = 3000
+
+                if node.requires_search and node.model_id.startswith(search_unsafe_prefixes):
+                    caps = ["has_search"]
+                    if node.requires_tools:
+                        caps.append("has_tools")
+                    info = get_model_info(node.model_id)
+                    preferred_tier = info.get("tier", 3) if info else 3
+                    replacement = get_optimal_model(
+                        preferred_tier,
+                        8192,
+                        tiers,
+                        required_capabilities=caps,
+                        excluded_model_ids=list(failed_model_ids),
+                        excluded_prefixes=list(search_unsafe_prefixes),
+                    )
+                    if replacement != node.model_id:
+                        logging.warning(
+                            f"Search-safe replacement: {node.node_id} model {node.model_id} -> {replacement}"
+                        )
+                        node.model_id = replacement
             
             await safe_send(websocket, {
                 "event": "topology_update",
@@ -642,12 +730,27 @@ async def execute_live_swarm(websocket: WebSocket, message: str, models_dict: di
             fs_manager.write_file(f"{artifact_dir}/topology_v{retry_count}.json", json.dumps(topology.dict(), indent=2))
 
             # 2. Execution (DAG Executor)
+            node_map = {n.node_id: n for n in topology.planned_nodes}
+
             async def node_callback(event):
                 await safe_send(websocket, event)
                 if event.get("type") == "NODE_STATUS" and event.get("status") == "completed":
                     n_id = event["node_id"]
                     content = event["content"]
                     fs_manager.write_file(f"{artifact_dir}/node_{n_id}.md", content)
+
+                    node_meta = node_map.get(n_id)
+                    if node_meta and node_meta.agent_type in {"coder", "coding"}:
+                        code, lang = extract_best_code_block(content)
+                        if code:
+                            requested_name = infer_requested_file_name(n_id, lang)
+                            fs_manager.write_file(f"{artifact_dir}/{requested_name}", code)
+                            append_chat_log(
+                                f"📄 Node `{n_id}` File",
+                                f"Wrote requested artifact: `{requested_name}`",
+                                "artifact",
+                            )
+
                     append_chat_log(f"✅ Node `{n_id}` Output", content, "completed")
                 elif event.get("type") == "NODE_STATUS" and event.get("status") == "failed":
                     n_id = event["node_id"]
@@ -669,6 +772,12 @@ async def execute_live_swarm(websocket: WebSocket, message: str, models_dict: di
             else:
                 retry_count += 1
                 previous_results = report.results
+
+                # Blacklist models that just failed to avoid repeated bad provider/model loops.
+                for r in failed_critical_nodes:
+                    node_meta = node_map.get(r.node_id)
+                    if node_meta:
+                        failed_model_ids.add(node_meta.model_id)
                 
                 # Build a detailed root-cause summary for each failed node
                 root_cause_lines = []

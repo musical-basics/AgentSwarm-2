@@ -1,6 +1,9 @@
 import json
 import os
+import logging
 from typing import List, Dict, Any, Optional
+
+logger = logging.getLogger(__name__)
 
 def get_fallback_path():
     """Returns the absolute path to fallback_models.json."""
@@ -87,7 +90,14 @@ def get_model_info(model_id: str, file_path: Optional[str] = None) -> Optional[D
             return m
     return None
 
-def get_optimal_model(tier: int, min_context: int, tiers: Dict[str, List[Dict[str, Any]]], required_capabilities: List[str] = None) -> str:
+def get_optimal_model(
+    tier: int,
+    min_context: int,
+    tiers: Dict[str, List[Dict[str, Any]]],
+    required_capabilities: List[str] = None,
+    excluded_model_ids: Optional[List[str]] = None,
+    excluded_prefixes: Optional[List[str]] = None,
+) -> str:
     """
     Finds the best model in a tier that satisfies the context requirement and capabilities.
     required_capabilities: list of strings like ["has_tools", "has_search"]
@@ -97,10 +107,24 @@ def get_optimal_model(tier: int, min_context: int, tiers: Dict[str, List[Dict[st
     2. If not found, search ALL tiers and return cheapest capable model
     3. This means a search-required node will never fall back to a non-searching model
     """
+    excluded_id_set = set(excluded_model_ids or [])
+    excluded_prefix_tuple = tuple(excluded_prefixes or [])
+
+    def _is_allowed(model: Dict[str, Any]) -> bool:
+        model_id = model.get("id", "")
+        if model_id in excluded_id_set:
+            return False
+        if excluded_prefix_tuple and model_id.startswith(excluded_prefix_tuple):
+            return False
+        return True
+
     tier_key = f"tier{tier}"
     tier_models = tiers.get(tier_key, [])
     
-    candidates = [m for m in tier_models if m.get("context_length", 0) >= min_context]
+    candidates = [
+        m for m in tier_models
+        if m.get("context_length", 0) >= min_context and _is_allowed(m)
+    ]
     
     if required_capabilities:
         capable_candidates = [
@@ -115,6 +139,7 @@ def get_optimal_model(tier: int, min_context: int, tiers: Dict[str, List[Dict[st
                 m for m in all_models 
                 if all(m.get(cap, False) for cap in required_capabilities)
                 and m.get("context_length", 0) >= min_context
+                and _is_allowed(m)
             ]
             if all_capable:
                 # Pick cheapest capable model across all tiers
@@ -130,7 +155,14 @@ def get_optimal_model(tier: int, min_context: int, tiers: Dict[str, List[Dict[st
     if not candidates:
         # No context-length match in this tier — escalate to tier 1 (most capable)
         if tier > 1:
-            return get_optimal_model(tier - 1, min_context, tiers, required_capabilities)
+            return get_optimal_model(
+                tier - 1,
+                min_context,
+                tiers,
+                required_capabilities,
+                list(excluded_id_set),
+                list(excluded_prefix_tuple),
+            )
         return "openai/gpt-4o"  # Ultimate fallback
 
     # No capability requirements — sort by context length descending (most capable first within tier)

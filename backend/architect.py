@@ -2,12 +2,13 @@ import json
 import logging
 import asyncio
 import os
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Set
 from backend.architect_types import AgentNode, SwarmTopology
 from backend.models_tiering import load_and_tier_models, get_optimal_model, get_model_info
 import openai
 
 logger = logging.getLogger(__name__)
+SEARCH_UNSAFE_MODEL_PREFIXES = ("reka/",)
 
 ARCHITECT_SYSTEM_PROMPT = """
 You are "The Architect", the control node for a dynamic Directed Acyclic Graph (DAG) AI Swarm.
@@ -59,7 +60,8 @@ async def plan_swarm_dag(
     budget: float,
     architect_model: str = "openai/gpt-4o",
     api_key: str = None,
-    previous_results: Optional[List[Any]] = None
+    previous_results: Optional[List[Any]] = None,
+    banned_model_ids: Optional[Set[str]] = None,
 ) -> SwarmTopology:
     """
     Architects or Repairs the swarm execution plan.
@@ -103,7 +105,7 @@ async def plan_swarm_dag(
         raw_json = json.loads(response.choices[0].message.content)
         topology = SwarmTopology(**raw_json)
         
-        topology = validate_and_correct_budget(topology, budget, tiers)
+        topology = validate_and_correct_budget(topology, budget, tiers, banned_model_ids)
         # Always overwrite the LLM's estimate with our authoritative recalculated value
         logger.info(f"Architect estimated cost: ${topology.total_estimated_cost:.6f} (LLM self-report overwritten by validator)")
         return topology
@@ -112,7 +114,12 @@ async def plan_swarm_dag(
         logger.error(f"Architect planning failed: {str(e)}")
         raise
 
-def validate_and_correct_budget(topology: SwarmTopology, budget: float, tiers: Dict[str, List[Dict[str, Any]]]) -> SwarmTopology:
+def validate_and_correct_budget(
+    topology: SwarmTopology,
+    budget: float,
+    tiers: Dict[str, List[Dict[str, Any]]],
+    banned_model_ids: Optional[Set[str]] = None,
+) -> SwarmTopology:
     """
     Recalculates cost and swaps models to cheaper ones if budget is exceeded,
     while maintaining required capabilities (tools/search).
@@ -136,6 +143,40 @@ def validate_and_correct_budget(topology: SwarmTopology, budget: float, tiers: D
                 total += node_cost
         return total
 
+    banned_model_ids = banned_model_ids or set()
+
+    # Enforce per-run model restrictions before budget optimization.
+    for node in topology.planned_nodes:
+        caps = []
+        if node.requires_tools:
+            caps.append("has_tools")
+        if node.requires_search:
+            caps.append("has_search")
+
+        current_model_id = node.model_id
+        current_info = get_model_info(current_model_id)
+        preferred_tier = current_info.get("tier", 2) if current_info else 2
+
+        must_replace = (
+            current_model_id in banned_model_ids
+            or (node.requires_search and current_model_id.startswith(SEARCH_UNSAFE_MODEL_PREFIXES))
+        )
+
+        if must_replace:
+            replacement = get_optimal_model(
+                preferred_tier,
+                8192,
+                tiers,
+                required_capabilities=caps,
+                excluded_model_ids=list(banned_model_ids),
+                excluded_prefixes=list(SEARCH_UNSAFE_MODEL_PREFIXES if node.requires_search else ()),
+            )
+            if replacement != current_model_id:
+                logger.warning(
+                    f"Architect replaced model for node {node.node_id}: {current_model_id} -> {replacement}"
+                )
+                node.model_id = replacement
+
     total_cost = calculate_cost(topology.planned_nodes)
     
     if total_cost > budget:
@@ -155,7 +196,14 @@ def validate_and_correct_budget(topology: SwarmTopology, budget: float, tiers: D
                 # Try next tier down
                 current_tier = m_info.get("tier", 1)
                 for next_tier in range(current_tier + 1, 4):
-                    new_model = get_optimal_model(next_tier, 8192, tiers, required_capabilities=caps)
+                    new_model = get_optimal_model(
+                        next_tier,
+                        8192,
+                        tiers,
+                        required_capabilities=caps,
+                        excluded_model_ids=list(banned_model_ids),
+                        excluded_prefixes=list(SEARCH_UNSAFE_MODEL_PREFIXES if node.requires_search else ()),
+                    )
                     if new_model != "openai/gpt-4o" or current_tier == 3:
                         node.model_id = new_model
                         # Re-calculate to see if we're under budget
