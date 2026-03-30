@@ -195,6 +195,7 @@ export function FlowmindIDE({ config = {} }: { config?: SwarmConfig }) {
   const [selectedSwarmConfigId, setSelectedSwarmConfigId] = useState("auto");
   const [baselineModel, setBaselineModel] = useState("openai/gpt-4.1-mini");
   const [isAbTesting, setIsAbTesting] = useState(false);
+  const [isGeneratingConfig, setIsGeneratingConfig] = useState(false);
   const [abResult, setAbResult] = useState<AbTestResult | null>(null);
 
   const monaco = useMonaco();
@@ -374,6 +375,15 @@ export function FlowmindIDE({ config = {} }: { config?: SwarmConfig }) {
           if (incoming.length > 0 && !incoming.find((c: SwarmConfigOption) => c.id === selectedSwarmConfigId)) {
             setSelectedSwarmConfigId(incoming[0].id);
           }
+        } else if (data.event === "config_generated") {
+          if (data.config?.id) {
+            setSelectedSwarmConfigId(data.config.id);
+          }
+          setIsGeneratingConfig(false);
+          setChatMessages(prev => [
+            ...prev,
+            { role: "agent" as any, content: data.message || "Generated a new swarm config." }
+          ]);
         } else if (data.event === "config_loaded") {
           if (data.config) {
              setNodeModels(prev => {
@@ -477,6 +487,7 @@ export function FlowmindIDE({ config = {} }: { config?: SwarmConfig }) {
         } else if (data.event === "workflow_complete") {
           setIsSimulating(false);
           setIsAbTesting(false);
+          setIsGeneratingConfig(false);
           setChatMessages(prev => [...prev, { role: "agent" as any, content: "Swarm workflow complete! Ready for next task." }]);
           setApprovalPendingNode(null);
         } else if (data.event === "ab_test_result") {
@@ -1183,7 +1194,7 @@ export function FlowmindIDE({ config = {} }: { config?: SwarmConfig }) {
 
                   {/* Run Swarm button — only visible after a preview */}
                   {previewedProfile && !isSimulating && (
-                    <div className="grid grid-cols-2 gap-2">
+                    <div className="grid grid-cols-3 gap-2">
                       <motion.button
                         initial={{ opacity: 0, y: -4 }}
                         animate={{ opacity: 1, y: 0 }}
@@ -1250,6 +1261,43 @@ export function FlowmindIDE({ config = {} }: { config?: SwarmConfig }) {
                       >
                         <GitBranch className="w-3.5 h-3.5" />
                         {isAbTesting ? "Running A/B..." : (selectedSwarmConfigId === "auto" ? "Pick Pinned Config" : "A/B Test")}
+                      </motion.button>
+
+                      <motion.button
+                        initial={{ opacity: 0, y: -4 }}
+                        animate={{ opacity: 1, y: 0 }}
+                        onClick={() => {
+                          if (!swarmInput.trim()) return;
+                          if (socketRef.current?.readyState === WebSocket.OPEN) {
+                            setIsGeneratingConfig(true);
+                            setIsAbTesting(true);
+                            setAbResult(null);
+                            socketRef.current.send(JSON.stringify({
+                              command: "generate_and_ab_test",
+                              message: swarmInput,
+                              models: nodeModels,
+                              budget,
+                              architectModel,
+                              baselineModel,
+                            }));
+                          }
+                        }}
+                        disabled={isGeneratingConfig || isAbTesting}
+                        className="flex items-center justify-center gap-2 w-full px-4 py-2.5 rounded-lg text-xs font-bold uppercase tracking-wider"
+                        style={{
+                          background: (isGeneratingConfig || isAbTesting)
+                            ? "rgba(52,211,153,0.08)"
+                            : "linear-gradient(135deg, rgba(52,211,153,0.2) 0%, rgba(34,211,238,0.15) 100%)",
+                          border: "1px solid rgba(52,211,153,0.5)",
+                          boxShadow: (isGeneratingConfig || isAbTesting) ? "none" : "0 0 18px rgba(52,211,153,0.25)",
+                          color: "#34d399",
+                          opacity: (isGeneratingConfig || isAbTesting) ? 0.6 : 1,
+                        }}
+                        whileHover={{ scale: (isGeneratingConfig || isAbTesting) ? 1 : 1.02 }}
+                        whileTap={{ scale: 0.98 }}
+                      >
+                        <Sparkles className="w-3.5 h-3.5" />
+                        {isGeneratingConfig ? "Generating..." : "Generate+AB"}
                       </motion.button>
                     </div>
                   )}

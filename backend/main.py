@@ -3,6 +3,7 @@ import os
 import uvicorn
 import logging
 import json
+import uuid
 from typing import Any, Dict
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -410,7 +411,7 @@ global_observer.start()
 llm = LLMEngine(os.getenv("OPENROUTER_API_KEY", ""))
 
 # Each config intentionally maps to exactly one workflow shape so runs are comparable.
-SWARM_CONFIGS: Dict[str, Dict[str, Any]] = {
+BASE_SWARM_CONFIGS: Dict[str, Dict[str, Any]] = {
     "auto": {
         "id": "auto",
         "name": "Auto Architect",
@@ -442,14 +443,57 @@ SWARM_CONFIGS: Dict[str, Dict[str, Any]] = {
 }
 
 
+def _generated_swarm_config_rel_dir() -> str:
+    return "swarm_configs/generated"
+
+
+def _load_generated_swarm_configs() -> Dict[str, Dict[str, Any]]:
+    generated: Dict[str, Dict[str, Any]] = {}
+    base_dir = os.path.join(fs_manager.workspace_path, _generated_swarm_config_rel_dir())
+    if not os.path.isdir(base_dir):
+        return generated
+
+    for name in os.listdir(base_dir):
+        if not name.endswith(".json"):
+            continue
+        full_path = os.path.join(base_dir, name)
+        try:
+            with open(full_path, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            cfg_id = cfg.get("id")
+            if not cfg_id:
+                continue
+            generated[cfg_id] = cfg
+        except Exception:
+            continue
+    return generated
+
+
+def _all_swarm_configs() -> Dict[str, Dict[str, Any]]:
+    merged = dict(BASE_SWARM_CONFIGS)
+    merged.update(_load_generated_swarm_configs())
+    return merged
+
+
+def _save_generated_swarm_config(config: Dict[str, Any]) -> None:
+    cfg_id = config.get("id")
+    if not cfg_id:
+        raise ValueError("Generated config missing id")
+    fs_manager.write_file(
+        f"{_generated_swarm_config_rel_dir()}/{cfg_id}.json",
+        json.dumps(config, indent=2),
+    )
+
+
 def get_swarm_config(config_id: str | None) -> Dict[str, Any]:
+    all_configs = _all_swarm_configs()
     if not config_id:
-        return SWARM_CONFIGS["auto"]
-    return SWARM_CONFIGS.get(config_id, SWARM_CONFIGS["auto"])
+        return all_configs["auto"]
+    return all_configs.get(config_id, all_configs["auto"])
 
 
 def list_swarm_configs() -> list[Dict[str, Any]]:
-    return list(SWARM_CONFIGS.values())
+    return list(_all_swarm_configs().values())
 
 
 def apply_swarm_config_to_prompt(user_message: str, config: Dict[str, Any]) -> str:
@@ -472,6 +516,17 @@ def apply_swarm_config_to_prompt(user_message: str, config: Dict[str, Any]) -> s
             "No dependencies, no extra nodes."
         )
         return user_message + constraint
+    if workflow == "custom_sequence":
+        sequence = [str(s).strip().lower() for s in config.get("node_sequence", []) if str(s).strip()]
+        if sequence:
+            ordered = " -> ".join(sequence)
+            constraint = (
+                "\n\nWORKFLOW CONSTRAINT (STRICT): "
+                f"Produce exactly {len(sequence)} nodes in this exact agent_type order: {ordered}. "
+                "Make a strict sequential chain where each node depends only on the previous node. "
+                "No extra nodes, no parallel branches, no role substitutions."
+            )
+            return user_message + constraint
     return user_message
 
 
@@ -501,6 +556,78 @@ def estimate_single_shot_max_tokens(prompt: str, target_cost: float, model_id: s
     remaining = max(0.0, target_cost - (p_in * estimated_prompt_tokens))
     max_tokens = int(remaining / p_out) if p_out > 0 else 1000
     return max(128, min(max_tokens, 4000))
+
+
+def _normalize_node_sequence(seq: list[str]) -> list[str]:
+    allowed = {
+        "planner",
+        "commander",
+        "worker",
+        "wizard",
+        "researcher",
+        "analyst",
+        "writer",
+        "coder",
+        "qa",
+        "reviewer",
+    }
+    out: list[str] = []
+    for item in seq:
+        role = str(item).strip().lower()
+        if role in allowed:
+            out.append(role)
+    return out
+
+
+async def generate_custom_swarm_config(
+    prompt: str,
+    budget: float,
+    architect_model: str,
+) -> Dict[str, Any]:
+    system_prompt = (
+        "You design reusable AI swarm workflows.\n"
+        "Given a user request and budget, create exactly ONE reusable workflow config.\n"
+        "Available node roles: planner, commander, worker, wizard, researcher, analyst, writer, coder, qa, reviewer.\n"
+        "Choose 2-6 roles in the best execution order for this request.\n"
+        "Return JSON ONLY with keys: name, description, node_sequence, baseline_model."
+    )
+    user_prompt = (
+        f"User request: {prompt}\n"
+        f"Budget: ${budget}\n"
+        "Create a config that can be reused for similar requests and optimized for quality per cost."
+    )
+
+    raw, _ = await llm.generate(system_prompt, user_prompt, model_name=architect_model, is_json=True, max_tokens=900)
+    clean = raw.strip()
+    if clean.startswith("```json"):
+        clean = clean[7:]
+    elif clean.startswith("```"):
+        clean = clean[3:]
+    if clean.endswith("```"):
+        clean = clean[:-3]
+
+    payload = json.loads(clean.strip())
+    node_sequence = _normalize_node_sequence(payload.get("node_sequence", []))
+    if len(node_sequence) < 2:
+        node_sequence = ["researcher", "analyst", "writer"]
+
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    rand = uuid.uuid4().hex[:6]
+    config_id = f"gen_{timestamp}_{rand}"
+
+    cfg = {
+        "id": config_id,
+        "name": payload.get("name") or f"Generated Swarm {timestamp}",
+        "description": payload.get("description") or "Architect-generated custom swarm config.",
+        "workflow": "custom_sequence",
+        "node_sequence": node_sequence,
+        "baseline_model": payload.get("baseline_model") or "openai/gpt-4.1-mini",
+        "created_at": datetime.datetime.now().isoformat(),
+        "source": "architect_generated",
+        "seed_prompt": prompt[:300],
+    }
+    _save_generated_swarm_config(cfg)
+    return cfg
 
 
 async def run_single_shot_baseline(prompt: str, model_id: str, target_cost: float) -> Dict[str, Any]:
@@ -1844,6 +1971,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
                     files = fs_manager.list_files()
                     await safe_send(websocket,{"event": "file_list", "files": files, "workspace_name": workspace_name})
+                    await safe_send(websocket, {"event": "swarm_configs", "configs": list_swarm_configs()})
 
                     # Re-load config from new workspace
                     config_data = get_workspace_config(fs_manager.workspace_path)
@@ -1975,6 +2103,65 @@ async def websocket_endpoint(websocket: WebSocket):
 
             elif command == "list_swarm_configs":
                 await safe_send(websocket, {"event": "swarm_configs", "configs": list_swarm_configs()})
+
+            elif command == "generate_swarm_config":
+                msg = data.get("message", "Build something")
+                budget = float(data.get("budget", 0.5))
+                architect_model = data.get("architectModel", "openai/gpt-4o")
+                try:
+                    cfg = await generate_custom_swarm_config(msg, budget, architect_model)
+                    await safe_send(websocket, {"event": "swarm_configs", "configs": list_swarm_configs()})
+                    await safe_send(
+                        websocket,
+                        {
+                            "event": "config_generated",
+                            "config": cfg,
+                            "message": f"Generated new reusable config: {cfg.get('name')} ({cfg.get('id')})",
+                        },
+                    )
+                except Exception as e:
+                    await safe_send(websocket, {"event": "error", "message": f"Failed to generate swarm config: {str(e)}"})
+
+            elif command == "generate_and_ab_test":
+                msg = data.get("message", "Build something")
+                models_dict = data.get("models", {})
+                budget = float(data.get("budget", 0.5))
+                architect_model = data.get("architectModel", "openai/gpt-4o")
+                baseline_model = data.get("baselineModel")
+
+                old_task = active_swarm_tasks.get(websocket)
+                if old_task and not old_task.done():
+                    old_task.cancel()
+
+                async def _gen_and_ab():
+                    try:
+                        cfg = await generate_custom_swarm_config(msg, budget, architect_model)
+                        await safe_send(websocket, {"event": "swarm_configs", "configs": list_swarm_configs()})
+                        await safe_send(
+                            websocket,
+                            {
+                                "event": "config_generated",
+                                "config": cfg,
+                                "message": f"Generated config {cfg.get('name')} and starting A/B test.",
+                            },
+                        )
+                        await execute_ab_test(
+                            websocket,
+                            msg,
+                            models_dict,
+                            budget,
+                            architect_model,
+                            cfg.get("id"),
+                            baseline_model,
+                        )
+                    except Exception as e:
+                        await safe_send(websocket, {"event": "error", "message": f"Generate+AB failed: {str(e)}"})
+                        await safe_send(websocket, {"event": "workflow_complete"})
+                    finally:
+                        active_swarm_tasks.pop(websocket, None)
+
+                task = asyncio.create_task(_gen_and_ab())
+                active_swarm_tasks[websocket] = task
 
             elif command == "ab_test":
                 msg = data.get("message", "Build something")
