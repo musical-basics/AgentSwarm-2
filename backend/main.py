@@ -647,6 +647,24 @@ async def execute_live_swarm(websocket: WebSocket, message: str, models_dict: di
                 return None, ""
             matches = re.findall(r"```([a-zA-Z0-9_+-]*)\n([\s\S]*?)```", content)
             if not matches:
+                # Fallback: some models return JSON with fields like {"code": "..."}.
+                clean = content.strip()
+                if clean.startswith("```json"):
+                    clean = clean[7:]
+                elif clean.startswith("```"):
+                    clean = clean[3:]
+                if clean.endswith("```"):
+                    clean = clean[:-3]
+
+                try:
+                    payload = json.loads(clean.strip())
+                    for key in ("code", "script", "content", "file_content"):
+                        candidate = payload.get(key)
+                        if isinstance(candidate, str) and candidate.strip():
+                            return candidate.strip(), "python"
+                except Exception:
+                    pass
+
                 return None, ""
             # Prefer the largest block; LLMs often put the complete file in the longest fenced block.
             language, code = max(matches, key=lambda m: len(m[1] or ""))
@@ -695,7 +713,7 @@ async def execute_live_swarm(websocket: WebSocket, message: str, models_dict: di
             # Runtime hardening: avoid search-unsafe providers and give coder nodes room to return complete files.
             tiers = load_and_tier_models()
             for node in topology.planned_nodes:
-                if node.agent_type in {"coder", "coding"} and node.max_tokens < 3000:
+                if node.agent_type in {"coder", "coding", "developer"} and node.max_tokens < 3000:
                     node.max_tokens = 3000
 
                 if node.requires_search and node.model_id.startswith(search_unsafe_prefixes):
@@ -740,7 +758,7 @@ async def execute_live_swarm(websocket: WebSocket, message: str, models_dict: di
                     fs_manager.write_file(f"{artifact_dir}/node_{n_id}.md", content)
 
                     node_meta = node_map.get(n_id)
-                    if node_meta and node_meta.agent_type in {"coder", "coding"}:
+                    if node_meta and node_meta.agent_type in {"coder", "coding", "developer"}:
                         code, lang = extract_best_code_block(content)
                         if code:
                             requested_name = infer_requested_file_name(n_id, lang)
@@ -1507,29 +1525,41 @@ async def websocket_endpoint(websocket: WebSocket):
 
             elif command == "set_workspace":
                 new_path = data.get("path")
-                if new_path and os.path.isdir(new_path):
+                try:
+                    if not new_path or not os.path.isdir(new_path):
+                        await safe_send(websocket,{"event": "error", "message": "Invalid directory path"})
+                        continue
+
                     fs_manager.workspace_path = os.path.abspath(new_path)
-                    files = fs_manager.list_files()
-                    
+
                     # Update global observer path
                     try:
                         global_observer.unschedule_all()
                         global_observer.schedule(global_watcher, fs_manager.workspace_path, recursive=True)
-                    except Exception:
-                        pass
-                    
+                    except Exception as obs_err:
+                        trace_event(f"Workspace watcher reset warning: {obs_err}", "ERROR")
+
                     # Persist global state
                     state["last_workspace"] = fs_manager.workspace_path
                     save_ide_state(state)
-                    
-                    await safe_send(websocket,{"event": "file_list", "files": files, "workspace_name": os.path.basename(fs_manager.workspace_path) or "Workspace"})
-                    
+
+                    workspace_name = os.path.basename(fs_manager.workspace_path) or "Workspace"
+                    await safe_send(websocket, {
+                        "event": "workspace_switched",
+                        "path": fs_manager.workspace_path,
+                        "workspace_name": workspace_name
+                    })
+
+                    files = fs_manager.list_files()
+                    await safe_send(websocket,{"event": "file_list", "files": files, "workspace_name": workspace_name})
+
                     # Re-load config from new workspace
                     config_data = get_workspace_config(fs_manager.workspace_path)
                     if config_data:
                         await safe_send(websocket,{"event": "config_loaded", "config": config_data})
-                else:
-                    await safe_send(websocket,{"event": "error", "message": "Invalid directory path"})
+                except Exception as e:
+                    trace_event(f"set_workspace failed: {e}", "ERROR")
+                    await safe_send(websocket,{"event": "error", "message": f"Failed to switch workspace: {str(e)}"})
 
             elif command == "save_layout":
                 state["layout"] = data.get("layout", state.get("layout", {}))

@@ -325,6 +325,14 @@ export function FlowmindIDE({ config = {} }: { config?: SwarmConfig }) {
               children: processFiles(data.files || [], workspaceName)
             }];
           });
+        } else if (data.event === "workspace_switched") {
+          // Reset editor selection/cache so UI clearly reflects the new workspace.
+          setSelectedFile("");
+          setFileContentsCache({});
+          setChatMessages(prev => [
+            ...prev,
+            { role: "agent" as any, content: `Workspace switched to: ${data.workspace_name || data.path}` }
+          ]);
         } else if (data.event === "models_list") {
           if (data.models) {
             setModelOptions(data.models);
@@ -473,6 +481,13 @@ export function FlowmindIDE({ config = {} }: { config?: SwarmConfig }) {
       if (folderPath && activeSocket && activeSocket.readyState === WebSocket.OPEN) {
         console.log("[OpenFolder] Sending set_workspace to backend:", folderPath);
         activeSocket.send(JSON.stringify({ command: "set_workspace", path: folderPath }));
+        // Defensive refresh in case backend emits file list before UI state settles.
+        setTimeout(() => {
+          if (activeSocket.readyState === WebSocket.OPEN) {
+            activeSocket.send(JSON.stringify({ command: "list_files", path: "" }));
+            activeSocket.send(JSON.stringify({ command: "load_config" }));
+          }
+        }, 150);
       } else {
         console.warn("[OpenFolder] Aborted - folderPath:", folderPath, "socketRef.readyState:", activeSocket?.readyState);
       }
