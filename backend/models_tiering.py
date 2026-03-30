@@ -5,6 +5,9 @@ from typing import List, Dict, Any, Optional
 
 logger = logging.getLogger(__name__)
 
+TIER1_PROMPT_PRICE = 0.0000015  # $1.50 / 1M prompt tokens
+TIER2_PROMPT_PRICE = 0.0000005  # $0.50 / 1M prompt tokens
+
 # ---------------------------------------------------------------------------
 # Model quality controls
 # ---------------------------------------------------------------------------
@@ -30,9 +33,9 @@ MODEL_BLACKLIST: frozenset = frozenset({
 # These are checked before falling back to cheapest/largest-context sorting.
 # Criteria: known reliability + high value-to-cost ratio.
 MODEL_PREFERRED: list = [
-    # --- Tier 1 (>$5/M) ---
+    # --- Tier 1 (>$1.50/M) ---
     "anthropic/claude-opus-4.6",        # 1M ctx, best-in-class quality
-    # --- Tier 2 (>$0.50/M) ---
+    # --- Tier 2 (>$0.50/M and <=$1.50/M) ---
     "anthropic/claude-sonnet-4.6",      # 1M ctx, excellent quality/cost
     "google/gemini-3.1-pro-preview",     # 1M ctx, latest Gemini Pro generation
     "openai/gpt-5.4-mini",              # 400k ctx, reliable mid-tier
@@ -56,7 +59,7 @@ def get_fallback_path():
 def load_and_tier_models(file_path: Optional[str] = None) -> Dict[str, List[Dict[str, Any]]]:
     """
     Loads models from fallback_models.json and tiers them by price.
-    Tier 1: High-end (> $5/1M tokens)
+    Tier 1: High-end (> $1.50/1M tokens)
     Tier 2: Mid-range (> $0.50/1M tokens)
     Tier 3: Cheap (<= $0.50/1M tokens)
     """
@@ -91,12 +94,12 @@ def load_and_tier_models(file_path: Optional[str] = None) -> Dict[str, List[Dict
         # Description keyword matching creates too many false positives (safety models, code search, etc.)
         m["has_search"] = pricing.get("web_search") is not None
         
-        # High Tier: > $5 per 1M tokens ($0.000005)
-        if p_in >= 0.000005: # Changed to >= to catch $5 exactly
+        # High Tier: >= $1.50 per 1M tokens
+        if p_in >= TIER1_PROMPT_PRICE:
             m["tier"] = 1
             tiers["tier1"].append(m)
-        # Medium Tier: > $0.50 per 1M tokens ($0.0000005)
-        elif p_in > 0.0000005:
+        # Medium Tier: > $0.50 and < $1.50 per 1M tokens
+        elif p_in > TIER2_PROMPT_PRICE:
             m["tier"] = 2
             tiers["tier2"].append(m)
         # Cheap Tier: <= $0.50 per 1M tokens
@@ -126,8 +129,8 @@ def get_model_info(model_id: str, file_path: Optional[str] = None) -> Optional[D
             
             # Add tier info too
             p_in = float(pricing.get("prompt", 0))
-            if p_in >= 0.000005: m["tier"] = 1
-            elif p_in > 0.0000005: m["tier"] = 2
+            if p_in >= TIER1_PROMPT_PRICE: m["tier"] = 1
+            elif p_in > TIER2_PROMPT_PRICE: m["tier"] = 2
             else: m["tier"] = 3
             
             return m
