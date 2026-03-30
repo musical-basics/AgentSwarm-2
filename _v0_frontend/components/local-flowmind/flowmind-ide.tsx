@@ -79,6 +79,7 @@ interface SwarmConfigOption {
   description: string;
   workflow: string;
   baseline_model?: string;
+  node_sequence?: string[];
 }
 
 interface AbTestResult {
@@ -193,6 +194,8 @@ export function FlowmindIDE({ config = {} }: { config?: SwarmConfig }) {
   const [approvalPendingNode, setApprovalPendingNode] = useState<string | null>(null);
   const [swarmConfigs, setSwarmConfigs] = useState<SwarmConfigOption[]>([]);
   const [selectedSwarmConfigId, setSelectedSwarmConfigId] = useState("auto");
+  const [selectedSwarmViewId, setSelectedSwarmViewId] = useState("auto");
+  const [showAllSwarms, setShowAllSwarms] = useState(false);
   const [baselineModel, setBaselineModel] = useState("openai/gpt-4.1-mini");
   const [isAbTesting, setIsAbTesting] = useState(false);
   const [isGeneratingConfig, setIsGeneratingConfig] = useState(false);
@@ -294,6 +297,21 @@ export function FlowmindIDE({ config = {} }: { config?: SwarmConfig }) {
     document.body.removeChild(link);
   };
 
+  const resolveSwarmFlow = (cfg?: SwarmConfigOption): string[] => {
+    if (!cfg) return [];
+    if (cfg.workflow === "custom_sequence" && Array.isArray(cfg.node_sequence) && cfg.node_sequence.length > 0) {
+      return cfg.node_sequence;
+    }
+    if (cfg.workflow === "single_writer") return ["writer"];
+    if (cfg.workflow === "single_coder") return ["coder"];
+    if (cfg.workflow === "research_analyze_write") return ["researcher", "analyst", "writer"];
+    if (cfg.workflow === "dynamic") return ["architect", "dynamic planner", "runtime nodes"];
+    return [];
+  };
+
+  const selectedSwarmView = swarmConfigs.find((c) => c.id === selectedSwarmViewId) || swarmConfigs[0];
+  const selectedSwarmFlow = resolveSwarmFlow(selectedSwarmView);
+
   // Models are now fetched via WebSocket to avoid browser CORS/ratelimits
 
   // Resizable panel state
@@ -374,6 +392,9 @@ export function FlowmindIDE({ config = {} }: { config?: SwarmConfig }) {
           setSwarmConfigs(incoming);
           if (incoming.length > 0 && !incoming.find((c: SwarmConfigOption) => c.id === selectedSwarmConfigId)) {
             setSelectedSwarmConfigId(incoming[0].id);
+          }
+          if (incoming.length > 0 && !incoming.find((c: SwarmConfigOption) => c.id === selectedSwarmViewId)) {
+            setSelectedSwarmViewId(incoming[0].id);
           }
         } else if (data.event === "config_generated") {
           if (data.config?.id) {
@@ -1059,6 +1080,20 @@ export function FlowmindIDE({ config = {} }: { config?: SwarmConfig }) {
                   {/* Config Action Buttons */}
                   <div className="flex items-center gap-2">
                     <motion.button
+                      onClick={() => setShowAllSwarms((v) => !v)}
+                      className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold uppercase tracking-wider transition-all"
+                      style={{
+                        background: showAllSwarms ? "rgba(52,211,153,0.2)" : "rgba(52,211,153,0.1)",
+                        border: "1px solid rgba(52,211,153,0.35)",
+                        color: "#34d399",
+                      }}
+                      whileHover={{ scale: 1.05, backgroundColor: "rgba(52,211,153,0.25)", boxShadow: "0 0 15px rgba(52,211,153,0.3)" }}
+                      whileTap={{ scale: 0.95 }}
+                    >
+                      <Network className="w-3.5 h-3.5" />
+                      All Swarms
+                    </motion.button>
+                    <motion.button
                       onClick={handleExportModels}
                       className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold uppercase tracking-wider transition-all"
                       style={{
@@ -1308,6 +1343,70 @@ export function FlowmindIDE({ config = {} }: { config?: SwarmConfig }) {
                     </div>
                   )}
                 </div>
+
+                {showAllSwarms && (
+                  <motion.div
+                    initial={{ opacity: 0, y: -6 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    className="bg-[#0d0d12]/95 backdrop-blur-md border border-[#34d399]/30 rounded-xl p-3 shadow-2xl"
+                  >
+                    <div className="grid grid-cols-3 gap-3">
+                      <div className="col-span-1 border border-[#34d399]/20 rounded-lg bg-black/30 p-2 max-h-56 overflow-auto">
+                        <div className="text-[9px] uppercase tracking-widest text-[#34d399] mb-2">Saved Swarms</div>
+                        <div className="space-y-1">
+                          {swarmConfigs.map((cfg) => (
+                            <button
+                              key={cfg.id}
+                              onClick={() => setSelectedSwarmViewId(cfg.id)}
+                              className="w-full text-left px-2 py-1.5 rounded text-[10px] border transition-colors"
+                              style={{
+                                borderColor: selectedSwarmViewId === cfg.id ? "rgba(52,211,153,0.55)" : "rgba(52,211,153,0.2)",
+                                background: selectedSwarmViewId === cfg.id ? "rgba(52,211,153,0.15)" : "transparent",
+                                color: selectedSwarmViewId === cfg.id ? "#a7f3d0" : "#d1d5db",
+                              }}
+                              title={cfg.description}
+                            >
+                              {cfg.name}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+
+                      <div className="col-span-2 border border-[#22d3ee]/20 rounded-lg bg-black/30 p-3">
+                        <div className="flex items-center justify-between mb-2">
+                          <div className="text-[10px] text-[#22d3ee] font-bold uppercase tracking-wider">Flow Preview</div>
+                          <div className="text-[9px] text-gray-400 uppercase tracking-widest">{selectedSwarmView?.workflow || "unknown"}</div>
+                        </div>
+                        <div className="text-[11px] text-white mb-2">{selectedSwarmView?.name || "No swarm selected"}</div>
+                        <div className="text-[10px] text-gray-400 mb-3">{selectedSwarmView?.description || ""}</div>
+
+                        <div className="flex flex-wrap items-center gap-2 mb-3">
+                          {selectedSwarmFlow.length > 0 ? selectedSwarmFlow.map((role, idx) => (
+                            <div key={`${role}-${idx}`} className="flex items-center gap-2">
+                              <div className="px-2 py-1 rounded border border-[#22d3ee]/35 bg-[#22d3ee]/10 text-[10px] text-[#67e8f9] uppercase tracking-wider">
+                                {role}
+                              </div>
+                              {idx < selectedSwarmFlow.length - 1 && <ChevronRight className="w-3 h-3 text-[#22d3ee]/70" />}
+                            </div>
+                          )) : (
+                            <div className="text-[10px] text-gray-500">No flow available.</div>
+                          )}
+                        </div>
+
+                        <div className="border border-[#a855f7]/20 rounded p-2 bg-[#0a0a0f]/60">
+                          <div className="text-[9px] text-[#a855f7] uppercase tracking-widest mb-1">Message Order</div>
+                          <div className="space-y-1 max-h-24 overflow-auto">
+                            {selectedSwarmFlow.map((role, idx) => (
+                              <div key={`msg-${role}-${idx}`} className="text-[10px] text-gray-300">
+                                {idx + 1}. {role} receives {idx === 0 ? "user request" : `output from ${selectedSwarmFlow[idx - 1]}`}
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  </motion.div>
+                )}
               </div>
 
               {/* Swarm Footer Controls (Moved to Bottom) */}
