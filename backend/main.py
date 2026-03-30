@@ -17,6 +17,7 @@ import termios
 import signal
 import datetime
 import traceback
+import re
 
 # --- GLOBAL STATE (HOISTED FOR ASGI WORKER STABILITY) ---
 active_ws_connections: list = []
@@ -642,6 +643,32 @@ async def generate_custom_swarm_config(
     return cfg
 
 
+def _is_clarification_seeking(text: str) -> bool:
+    """Returns True if the model punted and asked for more input instead of answering."""
+    patterns = [
+        r"please (upload|provide|share|send|attach)",
+        r"(upload|provide|attach|share|send).{0,50}(file|csv|data|document)",
+        r"(need|require|missing).{0,40}(file|csv|data|input)",
+        r"can'?t? (access|read|open|find|process).{0,40}(file|csv)",
+        r"don'?t? have.{0,40}(access|file|data)",
+        r"no (file|csv|data).{0,30}(provided|available|found|uploaded)",
+    ]
+    text_lower = text.lower()
+    return any(re.search(p, text_lower) for p in patterns)
+
+
+def _extract_file_refs(prompt: str) -> list:
+    """Extract filenames referenced in a prompt (quoted or bare .csv/.txt/.json/.xlsx)."""
+    quoted = re.findall(r"['\"]([^'\"]+\.\w+)['\"]", prompt)
+    bare = re.findall(r"\b(\w[\w\-]*\.(?:csv|txt|json|xlsx))\b", prompt)
+    seen, result = set(), []
+    for f in quoted + bare:
+        if f not in seen:
+            seen.add(f)
+            result.append(f)
+    return result
+
+
 async def run_single_shot_baseline(prompt: str, model_id: str, target_cost: float) -> Dict[str, Any]:
     max_tokens = estimate_single_shot_max_tokens(prompt, target_cost, model_id)
     system_prompt = (
@@ -727,7 +754,56 @@ async def execute_ab_test(
 
         arm_b = await run_single_shot_baseline(message, selected_baseline, max(arm_a_cost, 0.0001))
 
+        # --- Arm B fallback: detect if it punted and asked for more info ---
+        if _is_clarification_seeking(arm_b.get("content", "")):
+            file_refs = _extract_file_refs(message)
+            injected = False
+            for filename in file_refs:
+                try:
+                    file_content = fs_manager.read_file(filename)
+                    MAX_INJECT = 8000  # char cap to avoid token blowup
+                    snippet = file_content[:MAX_INJECT]
+                    if len(file_content) > MAX_INJECT:
+                        snippet += f"\n... [truncated at {MAX_INJECT} chars]"
+                    enriched_prompt = (
+                        f"{message}\n\n"
+                        f"--- Workspace file: {filename} ---\n{snippet}\n--- End of file ---"
+                    )
+                    await safe_send(websocket, {
+                        "event": "chat",
+                        "sender": "swarm",
+                        "text": (
+                            f"🔍 Arm B asked for `{filename}`. Found it in the workspace — "
+                            f"auto-injecting and retrying..."
+                        ),
+                        "stage": "origin",
+                    })
+                    arm_b = await run_single_shot_baseline(enriched_prompt, selected_baseline, max(arm_a_cost, 0.0001))
+                    injected = True
+                    break
+                except Exception:
+                    pass
+            if not injected:
+                missing = ", ".join(f"`{f}`" for f in file_refs) if file_refs else "the required data"
+                await safe_send(websocket, {
+                    "event": "chat",
+                    "sender": "swarm",
+                    "text": (
+                        f"🛑 **Arm B needs clarification** and {missing} could not be found automatically.\n"
+                        f"It asked: _{arm_b.get('content', '').strip()}_\n\n"
+                        f"Please add {missing} to the workspace and re-run the A/B test."
+                    ),
+                    "stage": "origin",
+                })
+                await safe_send(websocket, {
+                    "event": "clarification_needed",
+                    "arm": "b",
+                    "question": arm_b.get("content", ""),
+                    "missing_files": file_refs,
+                })
+
         run_timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+
         ab_dir = f"_swarm_artifacts/abtests/{run_timestamp}"
         arm_a_dir = f"{ab_dir}/arm_a_swarm"
         arm_b_dir = f"{ab_dir}/arm_b_single"
@@ -811,7 +887,6 @@ async def execute_ab_test(
     finally:
         active_swarm_tasks.pop(websocket, None)
 
-import re
 import subprocess
 
 async def execute_agent_chat(websocket: WebSocket, message: str, model: str, history: list, fs_mgr: FileSystemManager, models_dict: dict = None):
@@ -1012,6 +1087,33 @@ async def execute_live_swarm(
         search_unsafe_prefixes = ("reka/",)
         selected_config = get_swarm_config(swarm_config_id)
         planned_message = apply_swarm_config_to_prompt(message, selected_config)
+
+        # Proactively inject workspace file contents into the prompt so swarm nodes
+        # never need to ask the user to "upload" a file they can't access.
+        # This prevents the analyst_1 clarification-seeking failure + retry that doubles cost.
+        _injected_files = []
+        for _filename in _extract_file_refs(planned_message):
+            try:
+                _file_content = fs_manager.read_file(_filename)
+                _MAX_INJECT = 8000
+                _snippet = _file_content[:_MAX_INJECT]
+                if len(_file_content) > _MAX_INJECT:
+                    _snippet += f"\n... [truncated at {_MAX_INJECT} chars]"
+                planned_message = (
+                    f"{planned_message}\n\n"
+                    f"--- Workspace file: {_filename} ---\n{_snippet}\n--- End of file ---"
+                )
+                _injected_files.append(_filename)
+                logging.info(f"execute_live_swarm: pre-injected '{_filename}' into swarm prompt ({len(_snippet)} chars)")
+            except Exception:
+                pass
+        if _injected_files:
+            await safe_send(websocket, {
+                "event": "chat",
+                "sender": "swarm",
+                "text": f"📎 Auto-injected workspace file(s): {', '.join(f'`{f}`' for f in _injected_files)} into swarm context.",
+                "stage": "origin",
+            })
 
         def infer_requested_file_name(default_node_id: str, language_hint: str = "") -> str:
             explicit = re.search(r"\b([A-Za-z0-9_\-]+\.(?:py|js|ts|tsx|jsx|java|go|rs|cpp|c|cs|rb|php|swift|kt|sql|sh|html|css|json|ya?ml|md))\b", message)
