@@ -228,6 +228,9 @@ export function FlowmindIDE({ config = {} }: { config?: SwarmConfig }) {
   const [isChatTyping, setIsChatTyping] = useState(false);
 
   const [modelOptions, setModelOptions] = useState<any[]>([]);
+  const architectModelOptions = modelOptions.length
+    ? modelOptions
+    : [{ id: architectModel, name: architectModel }];
   const [nodeModels, setNodeModels] = useState({
     origin: { easy: "google/gemini-2.5-flash", medium: "google/gemini-2.5-flash", hard: "google/gemini-2.5-pro" },
     specFactory: { easy: "anthropic/claude-3-haiku", medium: "anthropic/claude-3.5-sonnet", hard: "anthropic/claude-3.5-sonnet" },
@@ -1197,9 +1200,11 @@ export function FlowmindIDE({ config = {} }: { config?: SwarmConfig }) {
                             onChange={(e) => setArchitectModel(e.target.value)}
                             className="w-full bg-black/40 border border-[#a855f7]/30 rounded px-2 py-1.5 text-[10px] text-white outline-none hover:border-[#a855f7]/60 transition-colors"
                           >
-                            <option value="openai/gpt-4o">GPT-4o (Swift)</option>
-                            <option value="anthropic/claude-3.5-sonnet">Claude 3.5</option>
-                            <option value="google/gemini-2.5-pro">Gemini 2.5</option>
+                            {architectModelOptions.map((m) => (
+                              <option key={m.id} value={m.id} title={m.name || m.id}>
+                                {m.name || m.id}
+                              </option>
+                            ))}
                           </select>
                         </div>
                       </div>
