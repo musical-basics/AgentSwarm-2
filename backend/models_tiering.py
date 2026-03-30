@@ -34,7 +34,7 @@ MODEL_PREFERRED: list = [
     "anthropic/claude-opus-4.6",        # 1M ctx, best-in-class quality
     # --- Tier 2 (>$0.50/M) ---
     "anthropic/claude-sonnet-4.6",      # 1M ctx, excellent quality/cost
-    "google/gemini-2.5-pro",            # 1M ctx, strong reasoning
+    "google/gemini-3.1-pro-preview",     # 1M ctx, latest Gemini Pro generation
     "openai/gpt-5.4-mini",              # 400k ctx, reliable mid-tier
     "qwen/qwen3-max-thinking",          # 262k ctx, strong reasoning budget
     # --- Tier 3 (≤$0.50/M) ---
