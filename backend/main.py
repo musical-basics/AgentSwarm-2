@@ -531,6 +531,22 @@ async def execute_ab_test(
 ):
     try:
         selected_config = get_swarm_config(swarm_config_id)
+        if selected_config.get("workflow") == "dynamic" or selected_config.get("id") == "auto":
+            await safe_send(
+                websocket,
+                {
+                    "event": "chat",
+                    "sender": "swarm",
+                    "text": (
+                        "⚠️ **A/B requires a pinned workflow config.**\n"
+                        "Select a non-auto Swarm Config (for example: Single Writer, Research -> Analyze -> Write, Single Coder) and run A/B again."
+                    ),
+                    "stage": "origin",
+                },
+            )
+            await safe_send(websocket, {"event": "workflow_complete"})
+            return
+
         await safe_send(
             websocket,
             {

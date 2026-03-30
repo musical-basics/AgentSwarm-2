@@ -1234,7 +1234,7 @@ export function FlowmindIDE({ config = {} }: { config?: SwarmConfig }) {
                             }));
                           }
                         }}
-                        disabled={isAbTesting}
+                        disabled={isAbTesting || selectedSwarmConfigId === "auto"}
                         className="flex items-center justify-center gap-2 w-full px-4 py-2.5 rounded-lg text-xs font-bold uppercase tracking-wider"
                         style={{
                           background: isAbTesting
@@ -1243,14 +1243,20 @@ export function FlowmindIDE({ config = {} }: { config?: SwarmConfig }) {
                           border: "1px solid rgba(250,204,21,0.5)",
                           boxShadow: isAbTesting ? "none" : "0 0 18px rgba(250,204,21,0.25)",
                           color: "#facc15",
-                          opacity: isAbTesting ? 0.6 : 1,
+                          opacity: (isAbTesting || selectedSwarmConfigId === "auto") ? 0.6 : 1,
                         }}
-                        whileHover={{ scale: isAbTesting ? 1 : 1.02 }}
+                        whileHover={{ scale: (isAbTesting || selectedSwarmConfigId === "auto") ? 1 : 1.02 }}
                         whileTap={{ scale: 0.98 }}
                       >
                         <GitBranch className="w-3.5 h-3.5" />
-                        {isAbTesting ? "Running A/B..." : "A/B Test"}
+                        {isAbTesting ? "Running A/B..." : (selectedSwarmConfigId === "auto" ? "Pick Pinned Config" : "A/B Test")}
                       </motion.button>
+                    </div>
+                  )}
+
+                  {previewedProfile && selectedSwarmConfigId === "auto" && !isSimulating && (
+                    <div className="text-[10px] text-[#facc15] px-1">
+                      A/B testing is enabled only for pinned workflow configs. Change Swarm Config from Auto Architect first.
                     </div>
                   )}
                 </div>
