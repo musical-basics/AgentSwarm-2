@@ -1,12 +1,44 @@
 import asyncio
 import os
-import uuid
 import logging
+import re
 from typing import List, Dict, Any, Callable, Coroutine
 from backend.architect_types import AgentNode, SwarmTopology, SwarmResult, SwarmExecutionReport
 import openai
 
 logger = logging.getLogger(__name__)
+
+
+def _is_writing_node(node: AgentNode) -> bool:
+    role = (node.agent_type or "").lower()
+    prompt = (node.prompt or "").lower()
+    return any(tag in role for tag in ["writer", "story", "editor"]) or any(
+        phrase in prompt for phrase in ["short story", "write a story", "blog post", "narrative"]
+    )
+
+
+def _writing_quality_issues(text: str) -> List[str]:
+    issues: List[str] = []
+    if not text or len(text.strip()) < 120:
+        issues.append("too_short")
+        return issues
+
+    # Detect camel/mixed uppercase artifacts like "LeapHIFFLED".
+    odd_caps = re.findall(r"\b[A-Za-z]*[A-Z]{3,}[A-Za-z]*\b", text)
+    if len(odd_caps) >= 2:
+        issues.append("odd_caps_artifacts")
+
+    # Detect long alphabetic tokens with no vowels, usually gibberish.
+    no_vowel_tokens = re.findall(r"\b(?=[A-Za-z]{8,}\b)[^AEIOUaeiou\W\d_]+\b", text)
+    if len(no_vowel_tokens) >= 2:
+        issues.append("no_vowel_gibberish")
+
+    # Detect repeated punctuation anomalies.
+    punct_runs = re.findall(r"[!?.,:;]{3,}", text)
+    if punct_runs:
+        issues.append("punctuation_noise")
+
+    return issues
 
 class AsyncDAGExecutor:
     def __init__(self, topology: SwarmTopology, websocket_callback: Callable[[Dict[str, Any]], Coroutine]):
@@ -128,6 +160,47 @@ class AsyncDAGExecutor:
                 node_cost = (p_in * usage.prompt_tokens) + (p_out * usage.completion_tokens)
             
             self.total_cost += node_cost
+
+            # Lightweight self-correction for writing outputs with obvious artifacts.
+            if _is_writing_node(node):
+                quality_issues = _writing_quality_issues(content or "")
+                if quality_issues:
+                    logger.warning(
+                        f"Node {node.node_id}: writing quality gate triggered ({', '.join(quality_issues)}); running one rewrite pass"
+                    )
+                    rewrite_response = await client.chat.completions.create(
+                        model=node.model_id,
+                        messages=[
+                            {
+                                "role": "system",
+                                "content": (
+                                    "You are an expert fiction editor. Rewrite the draft into fluent natural English. "
+                                    "Preserve the core plot and tone. Remove malformed words, gibberish, and awkward phrasing. "
+                                    "Return only the revised story text."
+                                ),
+                            },
+                            {
+                                "role": "user",
+                                "content": (
+                                    f"Original task:\n{node.prompt}\n\n"
+                                    f"Quality issues detected: {', '.join(quality_issues)}\n\n"
+                                    f"Draft to revise:\n{content}"
+                                ),
+                            },
+                        ],
+                        max_tokens=node.max_tokens,
+                    )
+                    revised = rewrite_response.choices[0].message.content
+                    rewrite_usage = rewrite_response.usage
+                    rewrite_cost = 0.0
+                    if m_info and rewrite_usage:
+                        p_in = float(m_info.get("pricing", {}).get("prompt", 0))
+                        p_out = float(m_info.get("pricing", {}).get("completion", 0))
+                        rewrite_cost = (p_in * rewrite_usage.prompt_tokens) + (p_out * rewrite_usage.completion_tokens)
+                    self.total_cost += rewrite_cost
+                    node_cost += rewrite_cost
+                    if revised:
+                        content = revised
             
             # Emit live cost update
             await self.websocket_callback({
