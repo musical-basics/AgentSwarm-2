@@ -547,7 +547,7 @@ async def execute_ab_test(
         arm_a = await execute_live_swarm(
             websocket,
             message,
-            models_dict,
+            _models_dict,
             budget,
             architect_model,
             swarm_config_id=swarm_config_id,
@@ -574,14 +574,37 @@ async def execute_ab_test(
 
         run_timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
         ab_dir = f"_swarm_artifacts/abtests/{run_timestamp}"
+        arm_a_dir = f"{ab_dir}/arm_a_swarm"
+        arm_b_dir = f"{ab_dir}/arm_b_single"
         os.makedirs(os.path.join(fs_manager.workspace_path, ab_dir), exist_ok=True)
-        fs_manager.write_file(f"{ab_dir}/arm_b_single_shot.md", arm_b.get("content", ""))
+        os.makedirs(os.path.join(fs_manager.workspace_path, arm_a_dir), exist_ok=True)
+        os.makedirs(os.path.join(fs_manager.workspace_path, arm_b_dir), exist_ok=True)
+
+        # Save both arms in one unified A/B folder for side-by-side review.
+        fs_manager.write_file(f"{arm_a_dir}/final_output.md", (arm_a or {}).get("final_content", ""))
+        fs_manager.write_file(f"{arm_a_dir}/summary.json", json.dumps(arm_a or {}, indent=2))
+        fs_manager.write_file(f"{arm_b_dir}/final_output.md", arm_b.get("content", ""))
+        fs_manager.write_file(f"{arm_b_dir}/summary.json", json.dumps(arm_b, indent=2))
+
+        source_run_dir = (arm_a or {}).get("artifact_dir")
+        if source_run_dir:
+            try:
+                chat_log = fs_manager.read_file(f"{source_run_dir}/chat_log.md")
+                fs_manager.write_file(f"{arm_a_dir}/chat_log.md", chat_log)
+            except Exception:
+                pass
+            try:
+                topology = fs_manager.read_file(f"{source_run_dir}/topology_v0.json")
+                fs_manager.write_file(f"{arm_a_dir}/topology_v0.json", topology)
+            except Exception:
+                pass
 
         result_payload = {
             "prompt": message,
             "swarm_config": selected_config,
             "arm_a": arm_a,
             "arm_b": arm_b,
+            "artifact_dir": ab_dir,
             "summary": {
                 "arm_a_cost": arm_a_cost,
                 "arm_b_cost": float(arm_b.get("cost", 0.0)),
