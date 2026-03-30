@@ -13,14 +13,17 @@ ARCHITECT_SYSTEM_PROMPT = """
 You are "The Architect", the control node for a dynamic Directed Acyclic Graph (DAG) AI Swarm.
 Your job is to read a User Request, analyze a User Budget, and generate an execution workflow.
 
-AVAILABLE MODELS & PRICING (Cost per 1 Token):
+AVAILABLE MODELS & PRICING (Cost per 1,000,000 tokens — i.e. $ per million tokens):
 {model_tiers_summary}
 
 THE MATHEMATICS (Realistic Cost Bounding):
-You must mathematically approximate the budget to ensure feasibility.
+IMPORTANT: Pricing is in $/million tokens. Convert to per-token: P_per_token = P_per_million / 1,000,000.
 1. T_in_est = 500 (Base Prompt) + Sum of (0.4 * max_tokens of ALL direct upstream dependencies)
-2. C_s = (T_in_est * P_in) + (max_tokens * P_out)
+2. C_s = (T_in_est * P_in / 1,000,000) + (max_tokens * P_out / 1,000,000)
 3. C_total = Sum of all C_s.
+
+For reference: A Tier 3 model at ~$0.10/M tokens running 500 tokens in + 500 tokens out ≈ $0.0001.
+Typical single-node research task with 500 in + 1000 out costs $0.0001–$0.001.
 
 CRITICAL DIRECTIVES:
 1. C_total MUST BE <= ${{user_budget_usd}}.
@@ -63,9 +66,14 @@ async def plan_swarm_dag(
     """
     tiers = load_and_tier_models()
     
-    tier_summary = f"Tier 1 (Premium): {[m['id'] for m in tiers['tier1'][:5]]}...\n"
-    tier_summary += f"Tier 2 (Mid): {[m['id'] for m in tiers['tier2'][:5]]}...\n"
-    tier_summary += f"Tier 3 (Cheap): {[m['id'] for m in tiers['tier3'][:5]]}..."
+    def _fmt_model(m):
+        p_in = float(m.get('pricing', {}).get('prompt', 0)) * 1_000_000
+        p_out = float(m.get('pricing', {}).get('completion', 0)) * 1_000_000
+        return f"{m['id']} (${p_in:.3f}/M in, ${p_out:.3f}/M out)"
+    
+    tier_summary = f"Tier 1 (Premium, >$5/M): {[_fmt_model(m) for m in tiers['tier1'][:3]]}\n"
+    tier_summary += f"Tier 2 (Mid, >$0.50/M): {[_fmt_model(m) for m in tiers['tier2'][:3]]}\n"
+    tier_summary += f"Tier 3 (Cheap, <=$0.50/M): {[_fmt_model(m) for m in tiers['tier3'][:5]]}"
 
     mode_context = ""
     if previous_results:
@@ -96,6 +104,8 @@ async def plan_swarm_dag(
         topology = SwarmTopology(**raw_json)
         
         topology = validate_and_correct_budget(topology, budget, tiers)
+        # Always overwrite the LLM's estimate with our authoritative recalculated value
+        logger.info(f"Architect estimated cost: ${topology.total_estimated_cost:.6f} (LLM self-report overwritten by validator)")
         return topology
         
     except Exception as e:

@@ -597,14 +597,36 @@ async def execute_live_swarm(websocket: WebSocket, message: str, models_dict: di
         max_retries = 2 # Allow up to 2 repair cycles
         cumulative_cost = 0.0
 
+        # --- Chat log accumulator ---
+        chat_log_lines = [
+            f"# Swarm Chat Log",
+            f"**Run ID:** {run_timestamp}",
+            f"**Prompt:** {message}",
+            f"**Budget:** ${budget}",
+            f"**Architect Model:** {architect_model}",
+            "---",
+            ""
+        ]
+        
+        def append_chat_log(role: str, text: str, tag: str = ""):
+            """Append a message to the chat log and flush to disk."""
+            tag_str = f" `[{tag}]`" if tag else ""
+            chat_log_lines.append(f"### {role}{tag_str}\n{text}\n")
+            try:
+                fs_manager.write_file(f"{artifact_dir}/chat_log.md", "\n".join(chat_log_lines))
+            except Exception as e:
+                logging.warning(f"Failed to write chat_log.md: {e}")
+
         while retry_count <= max_retries:
             # 1. Planning (Architect Agent)
+            arch_msg = f"🧠 **Architect Phase Started** (Retry: {retry_count}/{max_retries}) | Planning DAG..."
             await safe_send(websocket, {
                 "event": "chat", 
                 "sender": "swarm", 
-                "text": f"🧠 **Architect Phase Started** (Retry: {retry_count}/{max_retries}) | Planning DAG...", 
+                "text": arch_msg,
                 "stage": "origin"
             })
+            append_chat_log("🧠 Architect", arch_msg, f"retry={retry_count}")
             
             topology = await plan_swarm_dag(message, budget - cumulative_cost, architect_model, api_key, previous_results)
             
@@ -613,6 +635,9 @@ async def execute_live_swarm(websocket: WebSocket, message: str, models_dict: di
                 "topology": topology.dict(),
                 "summary": topology.workflow_summary
             })
+            
+            plan_msg = f"📊 **Plan Generated:** {topology.workflow_summary}  \n**Estimated Cost:** ${topology.total_estimated_cost:.4f}  \n**Nodes:** {len(topology.planned_nodes)}"
+            append_chat_log("📊 Plan", plan_msg, f"v{retry_count}")
             
             fs_manager.write_file(f"{artifact_dir}/topology_v{retry_count}.json", json.dumps(topology.dict(), indent=2))
 
@@ -623,6 +648,11 @@ async def execute_live_swarm(websocket: WebSocket, message: str, models_dict: di
                     n_id = event["node_id"]
                     content = event["content"]
                     fs_manager.write_file(f"{artifact_dir}/node_{n_id}.md", content)
+                    append_chat_log(f"✅ Node `{n_id}` Output", content, "completed")
+                elif event.get("type") == "NODE_STATUS" and event.get("status") == "failed":
+                    n_id = event["node_id"]
+                    err = event.get("error", "Unknown error")
+                    append_chat_log(f"❌ Node `{n_id}` Failed", f"Error: {err}", "failed")
 
             executor = AsyncDAGExecutor(topology, node_callback)
             active_executors[websocket] = executor # Store for manual approvals
@@ -639,20 +669,52 @@ async def execute_live_swarm(websocket: WebSocket, message: str, models_dict: di
             else:
                 retry_count += 1
                 previous_results = report.results
+                
+                # Build a detailed root-cause summary for each failed node
+                root_cause_lines = []
+                for r in failed_critical_nodes:
+                    if r.node_id.startswith("qa") and "FAIL" in r.content.upper():
+                        cause = "QA reviewer flagged output as failing quality checks"
+                    elif r.error_log and "budget" in r.error_log.lower():
+                        cause = f"Budget constraint — {r.error_log}"
+                    elif r.error_log and ("timeout" in r.error_log.lower() or "rate" in r.error_log.lower()):
+                        cause = f"API error — {r.error_log[:120]}"
+                    elif r.error_log:
+                        cause = f"Execution error — {r.error_log[:120]}"
+                    else:
+                        cause = "Node returned failed status with no output"
+                    root_cause_lines.append(f"  • `{r.node_id}`: {cause}")
+                
+                root_cause_str = "\n".join(root_cause_lines)
+                correction_msg = (
+                    f"⚠️ **Self-Correction Triggered.** Detected {len(failed_critical_nodes)} issue(s). "
+                    f"Requesting Healing DAG from Architect...\n\n"
+                    f"**Root Causes:**\n{root_cause_str}"
+                )
                 await safe_send(websocket, {
                     "event": "chat",
                     "sender": "swarm",
-                    "text": f"⚠️ **Self-Correction Triggered.** Detected {len(failed_critical_nodes)} issues. Requesting Healing DAG from Architect...",
+                    "text": correction_msg,
                     "stage": "origin"
                 })
+                append_chat_log("⚠️ Self-Correction", correction_msg, f"retry={retry_count}")
 
         # 4. Final Wrap Up
+        final_msg = f"✅ **Swarm Workflow Complete.**\nFinal Cumulative Cost: ${round(cumulative_cost, 4)}"
         await safe_send(websocket, {
             "event": "chat",
             "sender": "swarm",
-            "text": f"✅ **Swarm Workflow Complete.**\nFinal Cumulative Cost: ${round(cumulative_cost, 4)}",
+            "text": final_msg,
             "stage": "origin"
         })
+        append_chat_log("✅ Swarm Complete", final_msg)
+        # Add footer to chat log
+        chat_log_lines.append("---")
+        chat_log_lines.append(f"*Run ended at {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*")
+        try:
+            fs_manager.write_file(f"{artifact_dir}/chat_log.md", "\n".join(chat_log_lines))
+        except Exception as e:
+            logging.warning(f"Failed to write final chat_log.md: {e}")
         
         files = fs_manager.list_files()
         await safe_send(websocket, {"event": "file_list", "files": files, "workspace_name": os.path.basename(fs_manager.workspace_path)})
