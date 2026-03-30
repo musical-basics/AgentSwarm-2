@@ -32,7 +32,6 @@ MODEL_BLACKLIST: frozenset = frozenset({
 MODEL_PREFERRED: list = [
     # --- Tier 1 (>$5/M) ---
     "anthropic/claude-opus-4.6",        # 1M ctx, best-in-class quality
-    "openai/gpt-5.4-pro",               # Strong general + coding
     # --- Tier 2 (>$0.50/M) ---
     "anthropic/claude-sonnet-4.6",      # 1M ctx, excellent quality/cost
     "google/gemini-2.5-pro",            # 1M ctx, strong reasoning
