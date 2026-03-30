@@ -47,6 +47,12 @@ NODE COUNT HEURISTIC:
 - Complex (requires code + verification, multi-stage research): 3–5 nodes.
 - Only add nodes that directly produce a user-facing deliverable or are required dependencies.
 
+DAG OPTIMIZATION RULES:
+- Prefer a true DAG over a linear chain whenever subtasks are independent.
+- Run independent collection/research tasks in parallel and merge with a single downstream analyst/writer node.
+- Do not serialize nodes unless there is a hard data dependency.
+- Every dependency edge must be justified by required input from an upstream node.
+
 OUTPUT SCHEMA (STRICT JSON):
 {{
     "workflow_summary": "Brief summary of the execution plan",
@@ -86,8 +92,8 @@ async def plan_swarm_dag(
         p_out = float(m.get('pricing', {}).get('completion', 0)) * 1_000_000
         return f"{m['id']} (${p_in:.3f}/M in, ${p_out:.3f}/M out)"
     
-    tier_summary = f"Tier 1 (Premium, >$5/M): {[_fmt_model(m) for m in tiers['tier1']]}\n"
-    tier_summary += f"Tier 2 (Mid, >$0.50/M): {[_fmt_model(m) for m in tiers['tier2']]}\n"
+    tier_summary = f"Tier 1 (Premium, >=$1.50/M): {[_fmt_model(m) for m in tiers['tier1']]}\n"
+    tier_summary += f"Tier 2 (Mid, >$0.50/M and <$1.50/M): {[_fmt_model(m) for m in tiers['tier2']]}\n"
     tier_summary += f"Tier 3 (Cheap, <=$0.50/M): {[_fmt_model(m) for m in tiers['tier3']]}"
 
     mode_context = ""
