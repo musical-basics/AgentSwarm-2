@@ -29,10 +29,22 @@ Typical single-node research task with 500 in + 1000 out costs $0.0001–$0.001.
 CRITICAL DIRECTIVES:
 1. C_total MUST BE <= ${{user_budget_usd}}.
 2. CAPABILITIES: Set `requires_tools: True` if the node needs tool use. Set `requires_search: True` if the node needs real-time research (weather, news, prices, live data).
-3. Route trivial tasks to Tier 3/2. Route heavy coding/analyst to Tier 1.
+3. Route trivial tasks to Tier 3/2. Route heavy coding to Tier 1. Analyst and researcher nodes default to Tier 3.
 4. SEARCH NODES: If `requires_search` is True, the model executor will AUTOMATICALLY provide a search-capable system prompt. However, YOU must write the `prompt` field to start with an explicit action: e.g. "Search the web for the current weather in Tokyo and report..." — do NOT write vague prompts like "find weather data".
 5. If a task requires Search but fits no search-capable model within budget, prefer a cheap search-capable model over a non-searching one, OR output an 'error' node with a BUDGET_CONSTRAINT warning.
 6. If the budget is mathematically impossible for the required tasks, output a single step with agent_type="error_handler" explaining the budget deficit. Keep it under 30 words.
+
+NODE SELECTION RULES:
+- Only add a "coder" node if the task explicitly requires deliverable code as output.
+- Only add a "qa" node if the task requires verifying or testing code.
+- For pure research/analysis tasks (reading files, doing math, generating insights), use at most: researcher + analyst.
+- The final node's output IS the user's answer — do not end with a QA test suite unless tests were explicitly requested.
+
+NODE COUNT HEURISTIC:
+- Simple (single topic, no code): 1–2 nodes max.
+- Moderate (multi-topic, analysis + synthesis): 2–3 nodes max.
+- Complex (requires code + verification, multi-stage research): 3–5 nodes.
+- Only add nodes that directly produce a user-facing deliverable or are required dependencies.
 
 OUTPUT SCHEMA (STRICT JSON):
 {{
@@ -145,12 +157,11 @@ def validate_and_correct_budget(
 
     banned_model_ids = banned_model_ids or set()
 
-    # Agent-type minimum tier floors: QA, coder, and analyst must use at least Tier 2.
-    # This prevents cheap/edge models from being assigned to tasks requiring reasoning.
+    # Agent-type minimum tier floors: QA and coder must use at least Tier 2.
+    # Analyst and researcher default to Tier 3 (capable models like deepseek/grok handle math fine).
     AGENT_MIN_TIER = {
         "coder": 2,
         "qa": 2,
-        "analyst": 2,
     }
 
     for node in topology.planned_nodes:
@@ -176,6 +187,40 @@ def validate_and_correct_budget(
                         f"{node.model_id} (tier {current_tier}) -> {upgraded} (tier {min_tier})"
                     )
                     node.model_id = upgraded
+
+    # Agent-type maximum tier ceilings: coder, qa, and analyst should not use Tier 1
+    # (premium models) for standard tasks. Keeps cost predictable without sacrificing quality.
+    AGENT_MAX_TIER = {
+        "coder": 2,
+        "qa": 2,
+        "analyst": 2,
+    }
+
+    # Enforce max-tier ceilings: downgrade Tier 1 models to Tier 2 for standard agent types.
+    # A lower tier number = more expensive; ceiling means "don't go more expensive than this".
+    for node in topology.planned_nodes:
+        max_tier = AGENT_MAX_TIER.get((node.agent_type or "").lower())
+        if max_tier is not None:
+            current_info = get_model_info(node.model_id)
+            current_tier = current_info.get("tier", 3) if current_info else 3
+            if current_tier < max_tier:  # tier 1 < tier 2 means it's over-budget premium
+                caps = []
+                if node.requires_tools: caps.append("has_tools")
+                if node.requires_search: caps.append("has_search")
+                downgraded = get_optimal_model(
+                    max_tier,
+                    8192,
+                    tiers,
+                    required_capabilities=caps,
+                    excluded_model_ids=list(banned_model_ids),
+                    excluded_prefixes=list(SEARCH_UNSAFE_MODEL_PREFIXES if node.requires_search else ()),
+                )
+                if downgraded != node.model_id:
+                    logger.info(
+                        f"Tier ceiling downgrade for {node.node_id} ({node.agent_type}): "
+                        f"{node.model_id} (tier {current_tier}) -> {downgraded} (tier {max_tier})"
+                    )
+                    node.model_id = downgraded
 
     # Enforce per-run model restrictions before budget optimization.
     for node in topology.planned_nodes:
