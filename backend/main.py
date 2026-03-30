@@ -3,6 +3,7 @@ import os
 import uvicorn
 import logging
 import json
+from typing import Any, Dict
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
@@ -408,6 +409,225 @@ global_observer.start()
 
 llm = LLMEngine(os.getenv("OPENROUTER_API_KEY", ""))
 
+# Each config intentionally maps to exactly one workflow shape so runs are comparable.
+SWARM_CONFIGS: Dict[str, Dict[str, Any]] = {
+    "auto": {
+        "id": "auto",
+        "name": "Auto Architect",
+        "description": "Architect decides workflow dynamically.",
+        "workflow": "dynamic",
+        "baseline_model": "openai/gpt-4.1-mini",
+    },
+    "single_writer": {
+        "id": "single_writer",
+        "name": "Single Writer",
+        "description": "Exactly one writer node for creative/text generation.",
+        "workflow": "single_writer",
+        "baseline_model": "openai/gpt-4.1-mini",
+    },
+    "research_analyze_write": {
+        "id": "research_analyze_write",
+        "name": "Research -> Analyze -> Write",
+        "description": "Exactly three sequential nodes: researcher, analyst, writer.",
+        "workflow": "research_analyze_write",
+        "baseline_model": "openai/gpt-4.1-mini",
+    },
+    "single_coder": {
+        "id": "single_coder",
+        "name": "Single Coder",
+        "description": "Exactly one coder node for implementation tasks.",
+        "workflow": "single_coder",
+        "baseline_model": "openai/gpt-4.1-mini",
+    },
+}
+
+
+def get_swarm_config(config_id: str | None) -> Dict[str, Any]:
+    if not config_id:
+        return SWARM_CONFIGS["auto"]
+    return SWARM_CONFIGS.get(config_id, SWARM_CONFIGS["auto"])
+
+
+def list_swarm_configs() -> list[Dict[str, Any]]:
+    return list(SWARM_CONFIGS.values())
+
+
+def apply_swarm_config_to_prompt(user_message: str, config: Dict[str, Any]) -> str:
+    workflow = config.get("workflow", "dynamic")
+    if workflow == "single_writer":
+        constraint = (
+            "\n\nWORKFLOW CONSTRAINT (STRICT): Produce exactly 1 node with agent_type='writer' or 'creator'. "
+            "No dependencies, no extra nodes."
+        )
+        return user_message + constraint
+    if workflow == "research_analyze_write":
+        constraint = (
+            "\n\nWORKFLOW CONSTRAINT (STRICT): Produce exactly 3 nodes in this order with dependencies: "
+            "researcher -> analyst -> writer. No parallel branches."
+        )
+        return user_message + constraint
+    if workflow == "single_coder":
+        constraint = (
+            "\n\nWORKFLOW CONSTRAINT (STRICT): Produce exactly 1 node with agent_type='coder'/'developer'/'coding'. "
+            "No dependencies, no extra nodes."
+        )
+        return user_message + constraint
+    return user_message
+
+
+def get_model_catalog() -> list[dict]:
+    if cached_models:
+        return cached_models
+    try:
+        fallback_path = os.path.join(os.path.dirname(__file__), "fallback_models.json")
+        with open(fallback_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+
+def estimate_single_shot_max_tokens(prompt: str, target_cost: float, model_id: str) -> int:
+    models = get_model_catalog()
+    model = next((m for m in models if m.get("id") == model_id), None)
+    if not model:
+        return 1000
+    pricing = model.get("pricing", {})
+    p_in = float(pricing.get("prompt", 0) or 0)
+    p_out = float(pricing.get("completion", 0) or 0)
+    if p_out <= 0:
+        return 1000
+
+    estimated_prompt_tokens = max(120, int(len(prompt) / 4) + 120)
+    remaining = max(0.0, target_cost - (p_in * estimated_prompt_tokens))
+    max_tokens = int(remaining / p_out) if p_out > 0 else 1000
+    return max(128, min(max_tokens, 4000))
+
+
+async def run_single_shot_baseline(prompt: str, model_id: str, target_cost: float) -> Dict[str, Any]:
+    max_tokens = estimate_single_shot_max_tokens(prompt, target_cost, model_id)
+    system_prompt = (
+        "You are a high-quality single-shot assistant. Provide a complete, accurate final answer with clear structure, "
+        "good factual hygiene, and no placeholder sources."
+    )
+    content, usage = await llm.generate(system_prompt, prompt, model_name=model_id, max_tokens=max_tokens)
+    cost_payload = calculate_cost_payload(model_id, usage)
+    return {
+        "model_id": model_id,
+        "max_tokens": max_tokens,
+        "content": content,
+        "usage": cost_payload,
+        "cost": float(cost_payload.get("total_cost_usd", 0.0)),
+    }
+
+
+async def execute_ab_test(
+    websocket: WebSocket,
+    message: str,
+    _models_dict: dict,
+    budget: float,
+    architect_model: str,
+    swarm_config_id: str,
+    baseline_model: str | None,
+):
+    try:
+        selected_config = get_swarm_config(swarm_config_id)
+        await safe_send(
+            websocket,
+            {
+                "event": "chat",
+                "sender": "swarm",
+                "text": (
+                    f"🧪 **A/B Test Started**\nArm A: Swarm config **{selected_config.get('name')}**\n"
+                    f"Arm B: Single-shot baseline (cost-matched target)."
+                ),
+                "stage": "origin",
+            },
+        )
+
+        arm_a = await execute_live_swarm(
+            websocket,
+            message,
+            models_dict,
+            budget,
+            architect_model,
+            swarm_config_id=swarm_config_id,
+            emit_workflow_complete=False,
+            manage_active_task=False,
+        )
+        arm_a_cost = float((arm_a or {}).get("final_cost", 0.0))
+
+        selected_baseline = baseline_model or selected_config.get("baseline_model") or "openai/gpt-4.1-mini"
+        await safe_send(
+            websocket,
+            {
+                "event": "chat",
+                "sender": "swarm",
+                "text": (
+                    f"🧪 Running Arm B single-shot with **{selected_baseline}** "
+                    f"targeting Arm A spend (${arm_a_cost:.4f})."
+                ),
+                "stage": "origin",
+            },
+        )
+
+        arm_b = await run_single_shot_baseline(message, selected_baseline, max(arm_a_cost, 0.0001))
+
+        run_timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        ab_dir = f"_swarm_artifacts/abtests/{run_timestamp}"
+        os.makedirs(os.path.join(fs_manager.workspace_path, ab_dir), exist_ok=True)
+        fs_manager.write_file(f"{ab_dir}/arm_b_single_shot.md", arm_b.get("content", ""))
+
+        result_payload = {
+            "prompt": message,
+            "swarm_config": selected_config,
+            "arm_a": arm_a,
+            "arm_b": arm_b,
+            "summary": {
+                "arm_a_cost": arm_a_cost,
+                "arm_b_cost": float(arm_b.get("cost", 0.0)),
+                "cost_delta": float(arm_b.get("cost", 0.0)) - arm_a_cost,
+            },
+        }
+        fs_manager.write_file(f"{ab_dir}/ab_result.json", json.dumps(result_payload, indent=2))
+
+        await safe_send(
+            websocket,
+            {
+                "event": "ab_test_result",
+                "result": result_payload,
+            },
+        )
+        await safe_send(
+            websocket,
+            {
+                "event": "chat",
+                "sender": "swarm",
+                "text": (
+                    f"✅ **A/B Complete**\nArm A (Swarm): ${arm_a_cost:.4f}\n"
+                    f"Arm B (Single): ${float(arm_b.get('cost', 0.0)):.4f}\n"
+                    f"Artifacts: `{ab_dir}`"
+                ),
+                "stage": "origin",
+            },
+        )
+        await safe_send(websocket, {"event": "workflow_complete"})
+    except asyncio.CancelledError:
+        await safe_send(websocket, {"event": "workflow_complete"})
+    except Exception as e:
+        logging.error("A/B test failed: %s", e)
+        await safe_send(
+            websocket,
+            {
+                "event": "chat",
+                "sender": "swarm",
+                "text": f"⚠️ A/B test failed: {str(e)}",
+                "stage": "origin",
+            },
+        )
+        await safe_send(websocket, {"event": "workflow_complete"})
+    finally:
+        active_swarm_tasks.pop(websocket, None)
+
 import re
 import subprocess
 
@@ -583,7 +803,16 @@ async def classify_intent(prompt: str, model_id: str) -> tuple[str, int]:
         return "sniper", 1
     return "enterprise", 3
 
-async def execute_live_swarm(websocket: WebSocket, message: str, models_dict: dict = None, budget: float = 0.5, architect_model: str = "openai/gpt-4o"):
+async def execute_live_swarm(
+    websocket: WebSocket,
+    message: str,
+    models_dict: dict = None,
+    budget: float = 0.5,
+    architect_model: str = "openai/gpt-4o",
+    swarm_config_id: str = "auto",
+    emit_workflow_complete: bool = True,
+    manage_active_task: bool = True,
+):
     try:
         await safe_send(websocket, {"event": "workflow_start", "message": message})
         
@@ -598,6 +827,8 @@ async def execute_live_swarm(websocket: WebSocket, message: str, models_dict: di
         cumulative_cost = 0.0
         failed_model_ids = set()
         search_unsafe_prefixes = ("reka/",)
+        selected_config = get_swarm_config(swarm_config_id)
+        planned_message = apply_swarm_config_to_prompt(message, selected_config)
 
         def infer_requested_file_name(default_node_id: str, language_hint: str = "") -> str:
             explicit = re.search(r"\b([A-Za-z0-9_\-]+\.(?:py|js|ts|tsx|jsx|java|go|rs|cpp|c|cs|rb|php|swift|kt|sql|sh|html|css|json|ya?ml|md))\b", message)
@@ -677,6 +908,7 @@ async def execute_live_swarm(websocket: WebSocket, message: str, models_dict: di
             f"**Prompt:** {message}",
             f"**Budget:** ${budget}",
             f"**Architect Model:** {architect_model}",
+            f"**Swarm Config:** {selected_config.get('id')} ({selected_config.get('name')})",
             "---",
             ""
         ]
@@ -702,7 +934,7 @@ async def execute_live_swarm(websocket: WebSocket, message: str, models_dict: di
             append_chat_log("🧠 Architect", arch_msg, f"retry={retry_count}")
             
             topology = await plan_swarm_dag(
-                message,
+                planned_message,
                 budget - cumulative_cost,
                 architect_model,
                 api_key,
@@ -845,16 +1077,36 @@ async def execute_live_swarm(websocket: WebSocket, message: str, models_dict: di
         
         files = fs_manager.list_files()
         await safe_send(websocket, {"event": "file_list", "files": files, "workspace_name": os.path.basename(fs_manager.workspace_path)})
-        await safe_send(websocket, {"event": "workflow_complete"})
+        if emit_workflow_complete:
+            await safe_send(websocket, {"event": "workflow_complete"})
+
+        final_content = ""
+        if report and report.results:
+            successful = [r for r in report.results if r.status == "success" and r.content]
+            if successful:
+                final_content = successful[-1].content
+        return {
+            "run_id": run_timestamp,
+            "artifact_dir": artifact_dir,
+            "final_cost": round(cumulative_cost, 6),
+            "final_content": final_content,
+            "topology": topology.dict() if topology else None,
+            "retries": retry_count,
+            "swarm_config": selected_config,
+        }
         
     except asyncio.CancelledError:
         logging.info("Swarm execution cancelled by user")
+        return {"run_id": None, "artifact_dir": None, "final_cost": 0.0, "final_content": "", "cancelled": True}
     except Exception as e:
         logging.error(f"CRITICAL SWARM ERROR: {e}")
         await safe_send(websocket, {"event": "chat", "sender": "swarm", "text": f"CRITICAL CRASH: {str(e)}", "stage": "executor"})
-        await safe_send(websocket, {"event": "workflow_complete"})
+        if emit_workflow_complete:
+            await safe_send(websocket, {"event": "workflow_complete"})
+        return {"run_id": None, "artifact_dir": None, "final_cost": 0.0, "final_content": "", "error": str(e)}
     finally:
-        active_swarm_tasks.pop(websocket, None)
+        if manage_active_task:
+            active_swarm_tasks.pop(websocket, None)
         active_executors.pop(websocket, None)
 
 async def run_enterprise_loop(websocket: WebSocket, prompt: str, models: dict, max_tokens: int = 8192):
@@ -1493,6 +1745,7 @@ async def websocket_endpoint(websocket: WebSocket):
     # Send models list immediately
     models = await fetch_openrouter_models()
     await safe_send(websocket, {"event": "models_list", "models": models})
+    await safe_send(websocket, {"event": "swarm_configs", "configs": list_swarm_configs()})
     
     try:
         while True:
@@ -1600,6 +1853,8 @@ async def websocket_endpoint(websocket: WebSocket):
                 # Classification-only: show which profile/nodes will be used, don't execute
                 msg = data.get("message", "")
                 models_dict = data.get("models", {})
+                swarm_config_id = data.get("swarmConfigId", "auto")
+                selected_config = get_swarm_config(swarm_config_id)
                 origin_model = normalize_models_dict(models_dict, 3).get("origin", "google/gemini-2.0-flash-exp")
                 try:
                     await safe_send(websocket, {"event": "station_update", "station": "origin", "status": "active"})
@@ -1610,7 +1865,11 @@ async def websocket_endpoint(websocket: WebSocket):
                         "event": "load_profile",
                         "profile": profile,
                         "complexity": complexity,
-                        "message": f"🔍 **Preview:** Dispatcher selected **{profile.upper()}** pipeline | Complexity {complexity}/3 | Token budget: {max_tokens:,}\n\nClick **Run Swarm** to execute."
+                        "message": (
+                            f"🔍 **Preview:** Dispatcher selected **{profile.upper()}** pipeline | Complexity {complexity}/3 | "
+                            f"Token budget: {max_tokens:,}\n"
+                            f"Pinned config: **{selected_config.get('name')}**\n\nClick **Run Swarm** to execute."
+                        )
                     })
                     await safe_send(websocket, {"event": "preview_ready", "profile": profile, "complexity": complexity})
                     
@@ -1626,6 +1885,7 @@ async def websocket_endpoint(websocket: WebSocket):
                             "request": msg,
                             "profile": profile,
                             "complexity": complexity,
+                            "swarm_config_id": selected_config.get("id"),
                             "models": models_dict,
                             "budget": max_tokens,
                             "selected_origin": origin_model
@@ -1655,13 +1915,51 @@ async def websocket_endpoint(websocket: WebSocket):
                 models_dict = data.get("models", {})
                 budget = float(data.get("budget", 0.5))
                 architect_model = data.get("architectModel", "openai/gpt-4o")
+                swarm_config_id = data.get("swarmConfigId", "auto")
                 
                 # Cancel any existing task for this websocket before starting a new one
                 old_task = active_swarm_tasks.get(websocket)
                 if old_task and not old_task.done():
                     old_task.cancel()
                     
-                task = asyncio.create_task(execute_live_swarm(websocket, msg, models_dict, budget, architect_model))
+                task = asyncio.create_task(
+                    execute_live_swarm(
+                        websocket,
+                        msg,
+                        models_dict,
+                        budget,
+                        architect_model,
+                        swarm_config_id=swarm_config_id,
+                    )
+                )
+                active_swarm_tasks[websocket] = task
+
+            elif command == "list_swarm_configs":
+                await safe_send(websocket, {"event": "swarm_configs", "configs": list_swarm_configs()})
+
+            elif command == "ab_test":
+                msg = data.get("message", "Build something")
+                models_dict = data.get("models", {})
+                budget = float(data.get("budget", 0.5))
+                architect_model = data.get("architectModel", "openai/gpt-4o")
+                swarm_config_id = data.get("swarmConfigId", "auto")
+                baseline_model = data.get("baselineModel")
+
+                old_task = active_swarm_tasks.get(websocket)
+                if old_task and not old_task.done():
+                    old_task.cancel()
+
+                task = asyncio.create_task(
+                    execute_ab_test(
+                        websocket,
+                        msg,
+                        models_dict,
+                        budget,
+                        architect_model,
+                        swarm_config_id,
+                        baseline_model,
+                    )
+                )
                 active_swarm_tasks[websocket] = task
 
             elif command == "kill_swarm":

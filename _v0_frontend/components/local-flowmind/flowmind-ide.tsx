@@ -73,6 +73,31 @@ interface ChatMessage {
   commands?: { cmd: string; output: string }[];
 }
 
+interface SwarmConfigOption {
+  id: string;
+  name: string;
+  description: string;
+  workflow: string;
+  baseline_model?: string;
+}
+
+interface AbTestResult {
+  summary?: {
+    arm_a_cost?: number;
+    arm_b_cost?: number;
+    cost_delta?: number;
+  };
+  arm_a?: {
+    run_id?: string;
+    retries?: number;
+    swarm_config?: { name?: string; id?: string };
+  };
+  arm_b?: {
+    model_id?: string;
+    max_tokens?: number;
+  };
+}
+
 const initialFiles: FileItem[] = [
   {
     name: "src",
@@ -166,6 +191,11 @@ export function FlowmindIDE({ config = {} }: { config?: SwarmConfig }) {
   const [nodeResults, setNodeResults] = useState<Record<string, any>>({});
   const [runningCost, setRunningCost] = useState(0.0);
   const [approvalPendingNode, setApprovalPendingNode] = useState<string | null>(null);
+  const [swarmConfigs, setSwarmConfigs] = useState<SwarmConfigOption[]>([]);
+  const [selectedSwarmConfigId, setSelectedSwarmConfigId] = useState("auto");
+  const [baselineModel, setBaselineModel] = useState("openai/gpt-4.1-mini");
+  const [isAbTesting, setIsAbTesting] = useState(false);
+  const [abResult, setAbResult] = useState<AbTestResult | null>(null);
 
   const monaco = useMonaco();
 
@@ -287,6 +317,7 @@ export function FlowmindIDE({ config = {} }: { config?: SwarmConfig }) {
         setSocket(ws);
         socketRef.current = ws;
         ws.send(JSON.stringify({ command: "list_files", path: "" }));
+        ws.send(JSON.stringify({ command: "list_swarm_configs" }));
       };
 
       ws.onmessage = (event) => {
@@ -336,6 +367,12 @@ export function FlowmindIDE({ config = {} }: { config?: SwarmConfig }) {
         } else if (data.event === "models_list") {
           if (data.models) {
             setModelOptions(data.models);
+          }
+        } else if (data.event === "swarm_configs") {
+          const incoming = Array.isArray(data.configs) ? data.configs : [];
+          setSwarmConfigs(incoming);
+          if (incoming.length > 0 && !incoming.find((c: SwarmConfigOption) => c.id === selectedSwarmConfigId)) {
+            setSelectedSwarmConfigId(incoming[0].id);
           }
         } else if (data.event === "config_loaded") {
           if (data.config) {
@@ -439,8 +476,11 @@ export function FlowmindIDE({ config = {} }: { config?: SwarmConfig }) {
           setPreviewedProfile(data.profile);
         } else if (data.event === "workflow_complete") {
           setIsSimulating(false);
+          setIsAbTesting(false);
           setChatMessages(prev => [...prev, { role: "agent" as any, content: "Swarm workflow complete! Ready for next task." }]);
           setApprovalPendingNode(null);
+        } else if (data.event === "ab_test_result") {
+          setAbResult(data.result || null);
         } else if (data.event === "topology_update") {
           setTopology(data.topology);
           setChatMessages(prev => [...prev, { role: "agent" as any, content: `📊 **Plan Generated:** ${data.summary}` }]);
@@ -1068,9 +1108,15 @@ export function FlowmindIDE({ config = {} }: { config?: SwarmConfig }) {
                         if (e.key === "Enter" && swarmInput.trim() && socket && !isSimulating && !isPreviewing) {
                           setIsPreviewing(true);
                           setPreviewedProfile(null);
+                          setAbResult(null);
                           setNodeState({ origin: "idle", specFactory: "idle", overseer: "idle", planner: "idle", commander: "idle", executor: "idle", qaReviewer: "idle" });
                           setConnectionState({ originToSpec: false, specToOverseer: false, overseerToPlanner: false, plannerToCommander: false, commanderToExecutor: false, executorToQa: false });
-                          socket.send(JSON.stringify({ command: "preview_swarm", message: swarmInput.trim(), models: nodeModels }));
+                          socket.send(JSON.stringify({
+                            command: "preview_swarm",
+                            message: swarmInput.trim(),
+                            models: nodeModels,
+                            swarmConfigId: selectedSwarmConfigId,
+                          }));
                         }
                       }}
                       placeholder="Swarm Architect (Autonomous Planning)..."
@@ -1101,9 +1147,15 @@ export function FlowmindIDE({ config = {} }: { config?: SwarmConfig }) {
                           if (!socket) return;
                           setIsPreviewing(true);
                           setPreviewedProfile(null);
+                          setAbResult(null);
                           setNodeState({ origin: "idle", specFactory: "idle", overseer: "idle", planner: "idle", commander: "idle", executor: "idle", qaReviewer: "idle" });
                           setConnectionState({ originToSpec: false, specToOverseer: false, overseerToPlanner: false, plannerToCommander: false, commanderToExecutor: false, executorToQa: false });
-                          socket.send(JSON.stringify({ command: "preview_swarm", message: swarmInput.trim(), models: nodeModels }));
+                          socket.send(JSON.stringify({
+                            command: "preview_swarm",
+                            message: swarmInput.trim(),
+                            models: nodeModels,
+                            swarmConfigId: selectedSwarmConfigId,
+                          }));
                         }}
                         disabled={isPreviewing}
                         className="flex items-center gap-2 px-3 py-2 rounded-lg text-xs font-bold uppercase tracking-wider transition-all shrink-0"
@@ -1131,35 +1183,75 @@ export function FlowmindIDE({ config = {} }: { config?: SwarmConfig }) {
 
                   {/* Run Swarm button — only visible after a preview */}
                   {previewedProfile && !isSimulating && (
-                    <motion.button
-                      initial={{ opacity: 0, y: -4 }}
-                      animate={{ opacity: 1, y: 0 }}
-                      onClick={() => {
-                        if (socketRef.current?.readyState === WebSocket.OPEN) {
-                          socketRef.current.send(JSON.stringify({ 
-                            command: "swarm_message", 
-                            message: swarmInput, 
-                            models: nodeModels,
-                            budget,
-                            architectModel
-                          }));
-                          setSwarmInput("");
-                          setSwarmTab("topology");
-                        }
-                      }}
-                      className="flex items-center justify-center gap-2 w-full px-4 py-2.5 rounded-lg text-xs font-bold uppercase tracking-wider"
-                      style={{
-                        background: "linear-gradient(135deg, rgba(34,211,238,0.2) 0%, rgba(168,85,247,0.2) 100%)",
-                        border: "1px solid rgba(34,211,238,0.6)",
-                        boxShadow: "0 0 25px rgba(34,211,238,0.3), inset 0 0 20px rgba(34,211,238,0.08)",
-                        color: "#22d3ee",
-                      }}
-                      whileHover={{ scale: 1.02, boxShadow: "0 0 35px rgba(34,211,238,0.5)" }}
-                      whileTap={{ scale: 0.98 }}
-                    >
-                      <Play className="w-3.5 h-3.5" />
-                      Run {previewedProfile.toUpperCase()} Swarm
-                    </motion.button>
+                    <div className="grid grid-cols-2 gap-2">
+                      <motion.button
+                        initial={{ opacity: 0, y: -4 }}
+                        animate={{ opacity: 1, y: 0 }}
+                        onClick={() => {
+                          if (socketRef.current?.readyState === WebSocket.OPEN) {
+                            socketRef.current.send(JSON.stringify({ 
+                              command: "swarm_message", 
+                              message: swarmInput, 
+                              models: nodeModels,
+                              budget,
+                              architectModel,
+                              swarmConfigId: selectedSwarmConfigId,
+                            }));
+                            setSwarmInput("");
+                            setSwarmTab("topology");
+                          }
+                        }}
+                        className="flex items-center justify-center gap-2 w-full px-4 py-2.5 rounded-lg text-xs font-bold uppercase tracking-wider"
+                        style={{
+                          background: "linear-gradient(135deg, rgba(34,211,238,0.2) 0%, rgba(168,85,247,0.2) 100%)",
+                          border: "1px solid rgba(34,211,238,0.6)",
+                          boxShadow: "0 0 25px rgba(34,211,238,0.3), inset 0 0 20px rgba(34,211,238,0.08)",
+                          color: "#22d3ee",
+                        }}
+                        whileHover={{ scale: 1.02, boxShadow: "0 0 35px rgba(34,211,238,0.5)" }}
+                        whileTap={{ scale: 0.98 }}
+                      >
+                        <Play className="w-3.5 h-3.5" />
+                        Run Swarm
+                      </motion.button>
+
+                      <motion.button
+                        initial={{ opacity: 0, y: -4 }}
+                        animate={{ opacity: 1, y: 0 }}
+                        onClick={() => {
+                          if (!swarmInput.trim()) return;
+                          if (socketRef.current?.readyState === WebSocket.OPEN) {
+                            setIsAbTesting(true);
+                            setAbResult(null);
+                            socketRef.current.send(JSON.stringify({
+                              command: "ab_test",
+                              message: swarmInput,
+                              models: nodeModels,
+                              budget,
+                              architectModel,
+                              swarmConfigId: selectedSwarmConfigId,
+                              baselineModel,
+                            }));
+                          }
+                        }}
+                        disabled={isAbTesting}
+                        className="flex items-center justify-center gap-2 w-full px-4 py-2.5 rounded-lg text-xs font-bold uppercase tracking-wider"
+                        style={{
+                          background: isAbTesting
+                            ? "rgba(250,204,21,0.08)"
+                            : "linear-gradient(135deg, rgba(250,204,21,0.15) 0%, rgba(34,211,238,0.15) 100%)",
+                          border: "1px solid rgba(250,204,21,0.5)",
+                          boxShadow: isAbTesting ? "none" : "0 0 18px rgba(250,204,21,0.25)",
+                          color: "#facc15",
+                          opacity: isAbTesting ? 0.6 : 1,
+                        }}
+                        whileHover={{ scale: isAbTesting ? 1 : 1.02 }}
+                        whileTap={{ scale: 0.98 }}
+                      >
+                        <GitBranch className="w-3.5 h-3.5" />
+                        {isAbTesting ? "Running A/B..." : "A/B Test"}
+                      </motion.button>
+                    </div>
                   )}
                 </div>
               </div>
@@ -1221,6 +1313,59 @@ export function FlowmindIDE({ config = {} }: { config?: SwarmConfig }) {
                           </select>
                         </div>
                       </div>
+
+                      <div className="grid grid-cols-2 gap-4">
+                        <div className="space-y-2">
+                          <span className="text-[9px] text-[#22d3ee] uppercase tracking-widest flex items-center gap-1">
+                            <Network className="w-3 h-3" /> Swarm Config
+                          </span>
+                          <select
+                            value={selectedSwarmConfigId}
+                            onChange={(e) => setSelectedSwarmConfigId(e.target.value)}
+                            className="w-full bg-black/40 border border-[#22d3ee]/30 rounded px-2 py-1.5 text-[10px] text-white outline-none hover:border-[#22d3ee]/60 transition-colors"
+                          >
+                            {swarmConfigs.length > 0 ? swarmConfigs.map((cfg) => (
+                              <option key={cfg.id} value={cfg.id} title={cfg.description}>
+                                {cfg.name}
+                              </option>
+                            )) : (
+                              <option value="auto">Auto Architect</option>
+                            )}
+                          </select>
+                        </div>
+
+                        <div className="space-y-2">
+                          <span className="text-[9px] text-[#facc15] uppercase tracking-widest flex items-center gap-1">
+                            <GitBranch className="w-3 h-3" /> A/B Baseline
+                          </span>
+                          <select
+                            value={baselineModel}
+                            onChange={(e) => setBaselineModel(e.target.value)}
+                            className="w-full bg-black/40 border border-[#facc15]/30 rounded px-2 py-1.5 text-[10px] text-white outline-none hover:border-[#facc15]/60 transition-colors"
+                          >
+                            {architectModelOptions.map((m) => (
+                              <option key={m.id} value={m.id} title={m.name || m.id}>
+                                {m.name || m.id}
+                              </option>
+                            ))}
+                          </select>
+                        </div>
+                      </div>
+
+                      {abResult && (
+                        <div className="bg-black/40 border border-[#facc15]/30 rounded-lg p-3 space-y-1.5">
+                          <div className="text-[9px] uppercase tracking-widest text-[#facc15] font-bold">Last A/B Result</div>
+                          <div className="text-[10px] text-gray-200">
+                            Arm A ({abResult.arm_a?.swarm_config?.name || "Swarm"}): ${Number(abResult.summary?.arm_a_cost || 0).toFixed(4)}
+                          </div>
+                          <div className="text-[10px] text-gray-200">
+                            Arm B ({abResult.arm_b?.model_id || "Single-shot"}): ${Number(abResult.summary?.arm_b_cost || 0).toFixed(4)}
+                          </div>
+                          <div className="text-[10px] text-gray-400">
+                            Cost delta: ${Number(abResult.summary?.cost_delta || 0).toFixed(4)}
+                          </div>
+                        </div>
+                      )}
                     </motion.div>
                   )}
                 </AnimatePresence>
