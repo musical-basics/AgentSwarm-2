@@ -29,7 +29,7 @@ Typical single-node research task with 500 in + 1000 out costs $0.0001–$0.001.
 CRITICAL DIRECTIVES:
 1. C_total MUST BE <= ${{user_budget_usd}}.
 2. CAPABILITIES: Set `requires_tools: True` if the node needs tool use. Set `requires_search: True` if the node needs real-time research (weather, news, prices, live data).
-3. Route trivial tasks to Tier 3/2. Route heavy coding to Tier 1. Analyst and researcher nodes default to Tier 3.
+3. Route trivial tasks to Tier 3/2. Route heavy coding to Tier 1. Analyst and researcher nodes default to Tier 3. Simple scripts, calculations, and one-off data transforms should default coder nodes to Tier 3 unless the user explicitly asks for robustness, production quality, security, or advanced error handling.
 4. SEARCH NODES: If `requires_search` is True, the model executor will AUTOMATICALLY provide a search-capable system prompt. However, YOU must write the `prompt` field to start with an explicit action: e.g. "Search the web for the current weather in Tokyo and report..." — do NOT write vague prompts like "find weather data".
 5. If a task requires Search but fits no search-capable model within budget, prefer a cheap search-capable model over a non-searching one, OR output an 'error' node with a BUDGET_CONSTRAINT warning.
 6. If the budget is mathematically impossible for the required tasks, output a single step with agent_type="error_handler" explaining the budget deficit. Keep it under 30 words.
@@ -37,6 +37,7 @@ CRITICAL DIRECTIVES:
 NODE SELECTION RULES:
 - Only add a "coder" node if the task explicitly requires deliverable code as output.
 - Only add a "qa" node if the task requires verifying or testing code.
+- "reviewer" and "qa" nodes are non-critical by default unless the user explicitly asks for validation, review, or self-correction.
 - For pure research/analysis tasks (reading files, doing math, generating insights), use at most: researcher + analyst.
 - The final node's output IS the user's answer — do not end with a QA test suite unless tests were explicitly requested.
 
@@ -157,15 +158,33 @@ def validate_and_correct_budget(
 
     banned_model_ids = banned_model_ids or set()
 
-    # Agent-type minimum tier floors: QA and coder must use at least Tier 2.
-    # Analyst and researcher default to Tier 3 (capable models like deepseek/grok handle math fine).
+    # Agent-type minimum tier floors: QA must use at least Tier 2.
+    # Analyst, researcher, and most coder tasks default to Tier 3.
+    # Coder nodes are only promoted for explicitly premium/robust implementations.
     AGENT_MIN_TIER = {
-        "coder": 2,
         "qa": 2,
     }
 
+    PREMIUM_CODER_HINTS = (
+        "robust",
+        "production",
+        "error handling",
+        "hardened",
+        "security",
+        "postgres",
+        "postgresql",
+        "database",
+        "deploy",
+        "critical",
+    )
+
     for node in topology.planned_nodes:
-        min_tier = AGENT_MIN_TIER.get((node.agent_type or "").lower())
+        agent_type = (node.agent_type or "").lower()
+        min_tier = AGENT_MIN_TIER.get(agent_type)
+        if agent_type == "coder":
+            prompt_lower = (node.prompt or "").lower()
+            if any(hint in prompt_lower for hint in PREMIUM_CODER_HINTS):
+                min_tier = 2
         if min_tier is not None:
             current_info = get_model_info(node.model_id)
             current_tier = current_info.get("tier", 3) if current_info else 3

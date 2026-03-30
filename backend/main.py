@@ -1230,6 +1230,19 @@ async def execute_live_swarm(
             # Runtime hardening: avoid search-unsafe providers and give coder nodes room to return complete files.
             tiers = load_and_tier_models()
             for node in topology.planned_nodes:
+                role = (node.agent_type or "").lower()
+
+                # Reviewer/QA stages are advisory by default. If they fail on a task
+                # that did not explicitly request validation, do not force a full DAG retry.
+                if role in {"reviewer", "qa"}:
+                    msg_lower = message.lower()
+                    validation_requested = any(
+                        phrase in msg_lower
+                        for phrase in ("review", "validate", "verification", "verify", "qa", "test", "edge cases")
+                    )
+                    if not validation_requested:
+                        node.critical = False
+
                 if node.agent_type in {"coder", "coding", "developer"} and node.max_tokens < 3000:
                     node.max_tokens = 3000
 
@@ -1299,7 +1312,15 @@ async def execute_live_swarm(
             cumulative_cost += report.final_cost
 
             # 3. Check for Failures (Self-Correction Logic)
-            failed_critical_nodes = [r for r in report.results if r.status == "failed" or (r.node_id.startswith("qa") and "FAIL" in r.content.upper())]
+            failed_critical_nodes = []
+            for r in report.results:
+                node_meta = node_map.get(r.node_id)
+                if node_meta and not node_meta.critical:
+                    continue
+
+                content_upper = (r.content or "").upper()
+                if r.status == "failed" or (r.node_id.startswith("qa") and "FAIL" in content_upper):
+                    failed_critical_nodes.append(r)
             
             if not failed_critical_nodes:
                 # All good!

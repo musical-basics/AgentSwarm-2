@@ -173,7 +173,7 @@ class AsyncDAGExecutor:
                 extra_body=extra_body or None
             )
             
-            content = response.choices[0].message.content
+            content = response.choices[0].message.content or ""
             usage = response.usage
             
             # Precise cost tracking using model info
