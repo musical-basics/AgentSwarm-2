@@ -78,12 +78,12 @@ class AsyncDAGExecutor:
 
         client = openai.AsyncOpenAI(api_key=api_key or os.getenv("OPENROUTER_API_KEY"), base_url="https://openrouter.ai/api/v1")
         
-        # FIX 3: Build search-aware system prompt
+        # Build search-aware system prompt
         if node.requires_search:
             system_prompt = (
-                "You are a live research specialist with real-time web search capability. "
-                "You MUST use your search tool to find current, up-to-date information before responding. "
-                "Do NOT say you lack access to real-time data. Search the web right now and provide actual current results."
+                "You are a live research specialist. Real-time web search results will be injected into your context "
+                "automatically before you respond. Use those search results to answer accurately with current data. "
+                "Always cite specific facts from the search results (e.g., temperatures, precipitation %)."
             )
         elif node.requires_tools:
             system_prompt = (
@@ -95,9 +95,15 @@ class AsyncDAGExecutor:
         
         # 5. Actual LLM Execution
         try:
-            full_prompt = f"Previous Context:\n{dep_context}\n\nTask:\n{node.prompt}"
+            full_prompt = f"Previous Context:\n{dep_context}\n\nTask:\n{node.prompt}" if dep_context.strip() else node.prompt
+            
+            # Build extra_body: inject OpenRouter Web Search Plugin for search nodes.
+            # This middleware fetches live web results and prepends them to the LLM context
+            # BEFORE the model responds — works with ANY model, no native search support needed.
+            extra_body = {}
             if node.requires_search:
-                full_prompt += "\n\n[SEARCH REQUIRED: Use real-time web search to answer this query.]"
+                extra_body["plugins"] = [{"id": "web", "max_results": 5}]
+                logger.info(f"Node {node.node_id}: OpenRouter Web Search Plugin enabled (model={node.model_id})")
             
             response = await client.chat.completions.create(
                 model=node.model_id,
@@ -105,7 +111,8 @@ class AsyncDAGExecutor:
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": full_prompt}
                 ],
-                max_tokens=node.max_tokens
+                max_tokens=node.max_tokens,
+                extra_body=extra_body or None
             )
             
             content = response.choices[0].message.content
